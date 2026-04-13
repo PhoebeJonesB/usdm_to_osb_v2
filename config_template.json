@@ -1,0 +1,9 @@
+{
+    "api_base_url": "https://site/api",
+    "idp_url": "https://example.site",
+    "client_id": "client_id",
+    "client_secret": "YOUR_CLIENT_SECRET_HERE",
+    "username": "you@example.com",
+    "password": "xxxxx-xxxxx-xxxx",
+    "project_number": "CDISC DEV"
+}
