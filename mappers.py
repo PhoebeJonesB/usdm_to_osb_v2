@@ -18,6 +18,7 @@ Key design choices:
 import logging
 import re
 from difflib import get_close_matches
+from pathlib import Path
 from typing import Any
 
 from .ct_resolver import CTResolver
@@ -393,8 +394,10 @@ def map_epochs(design: dict, ct: CTResolver, api=None) -> list[dict]:
     if not epochs:
         return []
 
-    # Load mapping CSV
-    mapping_csv = r"C:\Users\HP\usdm_to_osb_refactored\epoch_mapping.csv"
+    # Load mapping CSV - relative to this file so it works on any OS
+    mapping_csv = Path(__file__).parent / "epoch_mapping.csv"
+    if not mapping_csv.exists():
+        raise FileNotFoundError(f"epoch_mapping.csv not found at {mapping_csv}")
     mapping_df = pd.read_csv(mapping_csv)
     logger.info("Loaded epoch_mapping.csv with %d rows", len(mapping_df))
 

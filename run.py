@@ -790,9 +790,9 @@ def upload_epochs(study_uid, design):
     # Load mapping CSV - try multiple locations
     csv_path = None
     for candidate in [
+        Path(__file__).parent / "epoch_mapping_updated.csv",
         Path(__file__).parent.parent / "epoch_mapping_updated.csv",
         Path("epoch_mapping_updated.csv"),
-        Path(r"C:\Users\HP\usdm_to_osb_refactored\epoch_mapping_updated.csv"),
     ]:
         if candidate.exists():
             csv_path = candidate
