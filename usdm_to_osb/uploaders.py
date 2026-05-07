@@ -187,12 +187,61 @@ def _resolve_endpoint_level_from_objective(ct: CTResolver, obj_level_name: str) 
     else:
         search = obj_level_name
 
-    resolved = ct.resolve("Endpoint Level", decode=search)
+    resolved = ct.resolve("Endpoint Level", decode=search, strict=True)
+    if resolved and not ct.term_is_in_codelist(resolved.get("term_uid"), "Endpoint Level"):
+        logger.warning("  Endpoint level term %s ('%s') is NOT in Endpoint Level codelist — discarding",
+                       resolved.get("term_uid"), resolved.get("name"))
+        resolved = None
     if resolved:
         logger.info("  Endpoint level derived from objective '%s' -> '%s' (%s)",
                     obj_level_name, resolved["name"], resolved["term_uid"])
         return resolved["term_uid"]
     return None
+
+
+def _resolve_endpoint_level_uid(ct: CTResolver, decode: str) -> tuple[str | None, str]:
+    """
+    Resolve endpoint-level term_uid dynamically from the Endpoint Level
+    codelist, using the endpoint's own level.decode (Primary/Secondary/etc).
+
+    Uses ``strict=True`` so a missing 'Endpoint Level' codelist does NOT
+    fuzzy-fall-back to Objective Level (which would return a valid-looking
+    but wrong term — OSB rejects it with "term not found in codelist").
+    Also validates the returned term actually belongs to Endpoint Level.
+
+    Returns (term_uid_or_None, label).
+    """
+    decode_lower = (decode or "").lower()
+    if "primary" in decode_lower:
+        canonical_candidates = ["Primary Outcome Measure", "Primary"]
+        label = "Primary"
+    elif "exploratory" in decode_lower:
+        canonical_candidates = ["Exploratory Outcome Measure", "Exploratory"]
+        label = "Exploratory"
+    else:
+        canonical_candidates = ["Secondary Outcome Measure", "Secondary"]
+        label = "Secondary"
+
+    candidates = ([decode] if decode else []) + canonical_candidates
+    for cand in candidates:
+        resolved = ct.resolve("Endpoint Level", decode=cand, strict=True)
+        if not resolved:
+            continue
+        term_uid = resolved.get("term_uid")
+        if not ct.term_is_in_codelist(term_uid, "Endpoint Level"):
+            logger.warning(
+                "    Endpoint level term %s ('%s') is NOT in Endpoint Level codelist — discarding",
+                term_uid, resolved.get("name"))
+            continue
+        logger.info("    Endpoint level resolved (strict): decode='%s' -> '%s' (%s)",
+                    cand, resolved.get("name"), term_uid)
+        return term_uid, label
+
+    logger.warning(
+        "    Endpoint level NOT RESOLVED for decode='%s' — Endpoint Level "
+        "codelist may be missing in this OSB instance, or none of %s match.",
+        decode, canonical_candidates)
+    return None, label
 
 
 def post_objectives_and_endpoints(
@@ -317,17 +366,9 @@ def post_objectives_and_endpoints(
             if not ep_text.strip():
                 continue
 
-            # Resolve endpoint level: Primary / Secondary / Exploratory
-            ep_level_decode = ep.get("level", {}).get("decode", "").lower()
-            if "primary" in ep_level_decode:
-                final_ep_level_uid = "C98772"
-                ep_level_label = "Primary"
-            elif "exploratory" in ep_level_decode:
-                final_ep_level_uid = "C98724"
-                ep_level_label = "Exploratory"
-            else:
-                final_ep_level_uid = "C98781"
-                ep_level_label = "Secondary"
+            # Resolve endpoint level dynamically from the Endpoint Level codelist
+            ep_level_decode = ep.get("level", {}).get("decode", "")
+            final_ep_level_uid, ep_level_label = _resolve_endpoint_level_uid(ct, ep_level_decode)
 
             logger.info("      [Ep %d] '%s...' level='%s' -> %s (%s)",
                          ep_idx + 1, ep_text[:50], ep_level_decode, final_ep_level_uid, ep_level_label)
@@ -773,13 +814,27 @@ class ActivitiesUploader:
     # ── API helpers ──────────────────────────────────────────────────────
 
     def _get_all_activities(self) -> list[dict]:
-        """Cached fetch of all activities from the frontend."""
+        """Cached fetch of ALL activities from the frontend library.
+
+        Frontend-first contract: every USDM activity is checked against the
+        full library (which includes activities created by previous studies
+        under their own TBD_<study_number> groups). A new activity is created
+        under TBD_<current study_number> ONLY when no library match is found.
+        """
         if self._activity_cache is not None:
             return self._activity_cache
         self._activity_cache = self.api.get_all_pages(
             "concepts/activities/activities")
-        logger.info("Cached %d activities from library", len(self._activity_cache))
-        # Log sample
+        # Audit log: how many TBD groups exist across all studies vs. our own
+        tbd_groups: set[str] = set()
+        for a in self._activity_cache:
+            for g in a.get("activity_groupings", []) or []:
+                gname = (g.get("activity_group_name") or "").strip()
+                if gname.upper().startswith("TBD_"):
+                    tbd_groups.add(gname)
+        logger.info("Cached %d activities from frontend library "
+                    "(%d distinct TBD_* groups visible across all studies)",
+                    len(self._activity_cache), len(tbd_groups))
         sample = [a.get("name", "?") for a in self._activity_cache[:10]]
         logger.info("  Sample activity names: %s%s", sample,
                      "..." if len(self._activity_cache) > 10 else "")

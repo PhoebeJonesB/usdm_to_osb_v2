@@ -191,24 +191,98 @@ def map_study_creation(usdm: dict, study_number: str) -> dict:
 
 # ── identification metadata ─────────────────────────────────────────────────
 
-def map_identification_metadata(version: dict) -> dict:
-    """Build identification_metadata.registry_identifiers from studyIdentifiers."""
-    identifiers = version.get("studyIdentifiers", [])
-    ct_gov_id = None
-    eudract_id = None
-    for ident in identifiers:
-        text = ident.get("text", "")
-        if text.startswith("NCT"):
-            ct_gov_id = text
-        elif text.startswith("20") and "-" in text:
-            eudract_id = text
+# OSB registry identifiers — full 13-field structure expected by the metadata
+# patch endpoint. Each id has a paired ``*_null_value_code`` used when the id
+# is intentionally unknown rather than just absent.
+_REGISTRY_ID_FIELDS = (
+    "ct_gov_id",
+    "eudract_id",
+    "universal_trial_number_utn",
+    "japanese_trial_registry_id_japic",
+    "investigational_new_drug_application_number_ind",
+    "eu_trial_number",
+    "civ_id_sin_number",
+    "national_clinical_trial_number",
+    "japanese_trial_registry_number_jrct",
+    "national_medical_products_administration_nmpa_number",
+    "eudamed_srn_number",
+    "investigational_device_exemption_ide_number",
+    "eu_pas_number",
+)
 
-    return {
-        "registry_identifiers": {
-            "ct_gov_id": ct_gov_id,
-            "eudract_id": eudract_id,
-        }
-    }
+# Heuristics: scope name keywords / regex hits on text -> registry id field.
+# Order matters — first match wins.
+_REGISTRY_SCOPE_RULES = (
+    ("ct_gov_id",                                          {"keywords": ("clinicaltrials.gov", "ct.gov", "clinicaltrials"), "prefix": ("NCT",)}),
+    ("eudract_id",                                         {"keywords": ("eudract",),                                       "regex": r"^\d{4}-\d{6}-\d{2}$"}),
+    ("universal_trial_number_utn",                         {"keywords": ("universal trial number", "utn", "who utn"),       "prefix": ("U1111-",)}),
+    ("japanese_trial_registry_id_japic",                   {"keywords": ("japic",),                                         "prefix": ("JapicCTI-", "JAPIC")}),
+    ("investigational_new_drug_application_number_ind",    {"keywords": ("investigational new drug", " ind ", "ind number")}),
+    ("eu_trial_number",                                    {"keywords": ("eu trial number", "ctis", "ct-")}),
+    ("civ_id_sin_number",                                  {"keywords": ("civ-id", "sin number")}),
+    ("national_clinical_trial_number",                     {"keywords": ("national clinical trial",)}),
+    ("japanese_trial_registry_number_jrct",                {"keywords": ("jrct",),                                          "prefix": ("jRCT", "JRCT")}),
+    ("national_medical_products_administration_nmpa_number", {"keywords": ("nmpa",)}),
+    ("eudamed_srn_number",                                 {"keywords": ("eudamed", "srn")}),
+    ("investigational_device_exemption_ide_number",        {"keywords": ("ide number", "investigational device")}),
+    ("eu_pas_number",                                      {"keywords": ("eu pas", "encepp", "pas number")}),
+)
+
+
+def _classify_registry_identifier(ident: dict) -> str | None:
+    """Determine which OSB registry-identifier field a USDM studyIdentifier maps to.
+
+    Two-pass routing — organization-name keywords (most specific) win over
+    text-prefix heuristics (more ambiguous: ``"NCT-NAT-…"`` starts with NCT
+    but isn't a ClinicalTrials.gov id).
+    """
+    text = (ident.get("text") or "").strip()
+    scope = ident.get("scope") or {}
+    org = scope.get("organization") if isinstance(scope, dict) else None
+    org_name = (org.get("name") if isinstance(org, dict) else "") or ""
+    org_haystack = org_name.lower()
+
+    # Pass 1: organization-name keyword match
+    for field, rule in _REGISTRY_SCOPE_RULES:
+        for kw in rule.get("keywords", ()):
+            if kw in org_haystack:
+                return field
+
+    # Pass 2: text-prefix / regex heuristic
+    for field, rule in _REGISTRY_SCOPE_RULES:
+        for prefix in rule.get("prefix", ()):
+            if text.startswith(prefix):
+                return field
+        rgx = rule.get("regex")
+        if rgx and re.match(rgx, text):
+            return field
+
+    # Pass 3: text-keyword fallback (covers identifiers with no scope.organization)
+    text_haystack = text.lower()
+    for field, rule in _REGISTRY_SCOPE_RULES:
+        for kw in rule.get("keywords", ()):
+            if kw in text_haystack:
+                return field
+    return None
+
+
+def map_identification_metadata(version: dict) -> dict:
+    """
+    Build ``identification_metadata.registry_identifiers`` in the verbose
+    OSB shape — all 13 registry id fields plus their ``*_null_value_code``
+    companions, with values populated where the USDM provides them.
+    """
+    registry: dict[str, Any] = {}
+    for field in _REGISTRY_ID_FIELDS:
+        registry[field] = None
+        registry[f"{field}_null_value_code"] = None
+
+    for ident in version.get("studyIdentifiers", []):
+        field = _classify_registry_identifier(ident)
+        if field and not registry.get(field):
+            registry[field] = (ident.get("text") or "").strip() or None
+
+    return {"registry_identifiers": registry}
 
 
 # ── study description ───────────────────────────────────────────────────────
@@ -318,22 +392,78 @@ def map_study_population(design: dict, ct: CTResolver) -> dict:
 
 # ── study intervention ───────────────────────────────────────────────────────
 
-def map_study_intervention(design: dict, ct: CTResolver) -> dict:
+def map_study_intervention(design: dict, ct: CTResolver, version: dict | None = None) -> dict:
+    """
+    Build study_intervention metadata.
+
+    Codelists used (each is aliased to its '<name> Response' variant in the
+    resolver so frontend codelist-name variants are picked up automatically):
+      - Intervention Model   → 'Intervention Model Response'
+      - Trial Blinding Schema→ 'Trial Blinding Schema Response'
+      - Trial Intent Type    → 'Trial Intent Type Response'
+      - Intervention Type    → 'Intervention Type Response'
+      - Control Type         → 'Control Type Response'
+
+    For intervention_type / control_type, we read first from the studyDesign
+    itself (``design.interventionType``/``design.controlType``) — added by
+    the synthesizer for test data — and fall back to
+    ``version.studyInterventions[0].type`` when present.
+    """
     result: dict[str, Any] = {}
 
     # intervention_model_code
     code, decode = _code_obj(design.get("model"))
     result["intervention_model_code"] = _term_or_none(ct.resolve("Intervention Model", code=code, decode=decode))
+    logger.info("  intervention_model_code: code=%s decode='%s' -> %s",
+                code, decode, result["intervention_model_code"])
 
     # trial_blinding_schema_code
     code, decode = _alias_code(design.get("blindingSchema"))
     result["trial_blinding_schema_code"] = _term_or_none(
         ct.resolve("Trial Blinding Schema", code=code, decode=decode)
     )
+    logger.info("  trial_blinding_schema_code: code=%s decode='%s' -> %s",
+                code, decode, result["trial_blinding_schema_code"])
 
     # trial_intent_types_codes
     intent_types = design.get("intentTypes", [])
     result["trial_intent_types_codes"] = ct.resolve_multiple("Trial Intent Type", intent_types) or None
+    logger.info("  trial_intent_types_codes: %d resolved from %d intentTypes",
+                len(result.get("trial_intent_types_codes") or []), len(intent_types))
+
+    # intervention_type_code: prefer design.interventionType (Code or AliasCode),
+    # else first studyInterventions[*].type from the version.
+    int_type_obj = design.get("interventionType")
+    if int_type_obj:
+        if isinstance(int_type_obj, dict) and "standardCode" in int_type_obj:
+            code, decode = _alias_code(int_type_obj)
+        else:
+            code, decode = _code_obj(int_type_obj)
+    else:
+        code, decode = ("", "")
+        if version:
+            for si in version.get("studyInterventions", []) or []:
+                code, decode = _code_obj(si.get("type"))
+                if code or decode:
+                    break
+    result["intervention_type_code"] = _term_or_none(
+        ct.resolve("Intervention Type", code=code, decode=decode)
+    )
+    logger.info("  intervention_type_code: code=%s decode='%s' -> %s",
+                code, decode, result["intervention_type_code"])
+
+    # control_type_code: studyDesign.controlType (synthesizer-provided)
+    ct_type_obj = design.get("controlType")
+    if ct_type_obj:
+        if isinstance(ct_type_obj, dict) and "standardCode" in ct_type_obj:
+            code, decode = _alias_code(ct_type_obj)
+        else:
+            code, decode = _code_obj(ct_type_obj)
+        result["control_type_code"] = _term_or_none(
+            ct.resolve("Control Type", code=code, decode=decode)
+        )
+        logger.info("  control_type_code: code=%s decode='%s' -> %s",
+                    code, decode, result["control_type_code"])
 
     return result
 
@@ -523,65 +653,464 @@ def map_study_elements(design: dict, ct: CTResolver) -> list[dict]:
 
 # ── visits (encounters) ─────────────────────────────────────────────────────
 
-def _build_instance_maps(design: dict) -> tuple[dict, dict, dict]:
-    """
-    Parse scheduleTimelines -> instances to build:
-      encounter_to_epoch:  {encounter_id: epoch_id}
-      encounter_to_instance: {encounter_id: instance_id}
-      instance_to_timing: {instance_id: timing_dict}
+# Default OSB contact mode UID for "On Site Visit" — used as a last-resort
+# fallback when the dynamic ONSITE submission lookup fails.
+_DEFAULT_ONSITE_CONTACT_MODE_UID = "CTTerm_000139"
 
-    The main timeline's ``instances`` array links encounters to epochs:
-        instance.encounterId -> encounter
-        instance.epochId     -> epoch
+
+def _normalize_phrase(s: str) -> str:
+    """Lowercase + replace hyphens/underscores with spaces, for fuzzy compare."""
+    return (s or "").lower().replace("-", " ").replace("_", " ").strip()
+
+
+def _resolve_visit_type_for_epoch(ct: CTResolver, epoch_name: str) -> dict | None:
     """
-    enc_to_epoch: dict[str, str] = {}
-    enc_to_instance: dict[str, str] = {}
-    instance_to_timing: dict[str, dict] = {}
+    Find a Visit Type term whose sponsor_preferred_name (or submission_value)
+    relates to the given epoch name.
+
+    Resolution order:
+      1. Direct codelist resolution by decode (handles aliases + fuzzy).
+      2. Word-set match: all significant words from epoch_name appear in
+         a term's sponsor name (or vice-versa).
+      3. Substring containment (epoch in term, or term in epoch).
+    """
+    if not epoch_name:
+        return None
+
+    # 1. Direct resolution
+    hit = ct.resolve("Visit Type", decode=epoch_name)
+    if hit:
+        return hit
+
+    # 2/3. Search the codelist's terms ourselves
+    terms = ct.list_terms_in_codelist("Visit Type")
+    if not terms:
+        return None
+
+    target = _normalize_phrase(epoch_name)
+    target_words = {w for w in target.split() if len(w) >= 3}
+
+    best = None
+    best_score = 0
+    for term in terms:
+        name = _normalize_phrase(term.get("name", ""))
+        if not name:
+            continue
+        name_words = set(name.split())
+        common = target_words & name_words
+        # Word-set match: all target words present in term name
+        if target_words and common == target_words and len(common) > best_score:
+            best, best_score = term, len(common)
+            continue
+        # Substring containment fallback (only if no word-match found yet)
+        if best is None and (target in name or name in target):
+            best = term
+    if best:
+        logger.info("  Visit type matched for epoch '%s' -> '%s' (%s)",
+                    epoch_name, best.get("name"), best.get("term_uid"))
+    return best
+
+
+# ── label/description parser ───────────────────────────────────────────────
+#
+# USDM authors often encode the epoch ↔ encounter ↔ timing relationship
+# directly in the slash-delimited label or description on either the
+# encounter or the linking instance, e.g.:
+#
+#   "Screening / Visit Identifier 1 / Visit Day -35 to Day -1 / Visit Window NA"
+#   "Screening / 1 / Day -35 to Day -1 / NA"
+#   "Visit Identifier 2 / Day 1 of Treatment / Visit Window ±3 days"
+#   "Treatment Phase / Visit Identifier 6 / Month 3 / Visit Window ±7 days"
+#
+# parse_visit_label_text() recovers as much structure as possible.
+# The output is consumed by build_visit_link_index() — when the structural
+# fields (instance.epochId, timing.relativeFromScheduledInstanceId, …) are
+# missing, the parsed values are used as a fallback.
+
+_VISIT_NUM_RE = re.compile(
+    r"^\s*(?:visit\s*identifier\s+)?(\d+)\s*$",
+    re.IGNORECASE,
+)
+_TIME_RANGE_RE = re.compile(
+    r"(?:visit\s+)?(day|days|week|weeks|month|months|year|years|hour|hours|min|mins|minute|minutes)"
+    r"\s+(-?\d+)"
+    r"(?:\s+to\s+(?:day|days|week|weeks|month|months|year|years|hour|hours|min|mins|minute|minutes)?\s*(-?\d+))?",
+    re.IGNORECASE,
+)
+_TIME_OF_PHASE_RE = re.compile(
+    r"(day|days|week|weeks|month|months|year|years)\s+(-?\d+)\s+of\s+\w+",
+    re.IGNORECASE,
+)
+_WINDOW_RE = re.compile(
+    r"(?:visit\s*window\s+)?(?:±|\+/-|\+/\-|\+\-)\s*(\d+)"
+    r"(?:\s*(day|days|week|weeks|month|months|hour|hours))?",
+    re.IGNORECASE,
+)
+_NA_RE = re.compile(r"^\s*(?:visit\s*window\s+)?(?:na|n/a)\s*$", re.IGNORECASE)
+
+
+def _normalize_time_unit(u: str | None) -> str | None:
+    if not u:
+        return None
+    u = u.lower().rstrip("s")
+    if u in ("min", "minute"):
+        return "minute"
+    return u
+
+
+def parse_visit_label_text(text: str | None) -> dict:
+    """
+    Parse a slash-delimited visit label/description. Returns a dict with
+    these keys (each value may be None when not present in the text):
+
+        epoch_name          e.g. "Screening", "Treatment Phase"
+        visit_number        e.g. 1, 2, 6
+        time_value          numeric, signed; e.g. -35, 1, 3
+        time_value_end      end of a range like "Day -35 to Day -1" -> -1
+        time_unit           "day", "week", "month", "year", "hour", "minute"
+        window_lower        signed (negative); e.g. -3, -7
+        window_upper        signed (positive); e.g. 3, 7
+        window_unit         "day", "week", "month", "hour"
+        raw_segments        list of trimmed segments — for diagnostics
+    """
+    out: dict[str, Any] = {
+        "epoch_name": None,
+        "visit_number": None,
+        "time_value": None,
+        "time_value_end": None,
+        "time_unit": None,
+        "window_lower": None,
+        "window_upper": None,
+        "window_unit": None,
+        "raw_segments": [],
+    }
+    if not text:
+        return out
+
+    segments = [s.strip() for s in text.split("/") if s.strip()]
+    out["raw_segments"] = segments
+    if not segments:
+        return out
+
+    classified = [False] * len(segments)
+
+    # 1. visit number — bare integer or "Visit Identifier N"
+    for i, seg in enumerate(segments):
+        m = _VISIT_NUM_RE.match(seg)
+        if m and out["visit_number"] is None:
+            out["visit_number"] = int(m.group(1))
+            classified[i] = True
+            break
+
+    # 2. time — "Day X of <phase>", "Day X to Day Y", "Day X", "Month 3"
+    for i, seg in enumerate(segments):
+        if classified[i]:
+            continue
+        m = _TIME_OF_PHASE_RE.search(seg)
+        if m and out["time_value"] is None:
+            out["time_unit"] = _normalize_time_unit(m.group(1))
+            out["time_value"] = int(m.group(2))
+            classified[i] = True
+            continue
+        m = _TIME_RANGE_RE.search(seg)
+        if m and out["time_value"] is None:
+            out["time_unit"] = _normalize_time_unit(m.group(1))
+            out["time_value"] = int(m.group(2))
+            if m.group(3) is not None:
+                out["time_value_end"] = int(m.group(3))
+            classified[i] = True
+            continue
+
+    # 3. window — "Visit Window NA", "NA", "±N days", "Visit Window ±7 days"
+    for i, seg in enumerate(segments):
+        if classified[i]:
+            continue
+        if _NA_RE.match(seg):
+            classified[i] = True   # explicit NA — leave window None
+            continue
+        m = _WINDOW_RE.search(seg)
+        if m:
+            n = int(m.group(1))
+            unit = _normalize_time_unit(m.group(2)) if m.group(2) else "day"
+            out["window_lower"] = -n
+            out["window_upper"] = n
+            out["window_unit"] = unit
+            classified[i] = True
+            continue
+
+    # 4. first remaining segment is treated as the epoch / phase name
+    for i, seg in enumerate(segments):
+        if not classified[i] and out["epoch_name"] is None:
+            out["epoch_name"] = seg
+            classified[i] = True
+            break
+
+    return out
+
+
+def _pick_label_text(instance: dict | None, encounter: dict | None) -> str:
+    """
+    Pick the most structured label/description text for parsing.
+
+    Prefers slash-delimited strings (more segments = more information),
+    falling back to whichever non-empty value is available. Looks at the
+    linking *instance* first because authors tend to put the structured
+    label there; the encounter is the fallback.
+    """
+    sources: list[dict] = []
+    if instance:
+        sources.append(instance)
+    if encounter:
+        sources.append(encounter)
+
+    best = ""
+    best_segments = 0
+    for src in sources:
+        for key in ("label", "description"):
+            text = (src.get(key) or "").strip()
+            if not text:
+                continue
+            n_segments = text.count("/")
+            if n_segments > best_segments:
+                best, best_segments = text, n_segments
+    if best:
+        return best
+
+    # No slash-delimited candidate — return the first non-empty value found
+    for src in sources:
+        for key in ("label", "description"):
+            text = (src.get(key) or "").strip()
+            if text:
+                return text
+    return ""
+
+
+def _resolve_onsite_contact_mode_uid(
+    ct: CTResolver,
+    fallback: str = _DEFAULT_ONSITE_CONTACT_MODE_UID,
+) -> str:
+    """
+    Look up the contact-mode term whose submission_value is "ONSITE".
+
+    Tries (in order):
+      1. exact submission_value "ONSITE" within the Visit Contact Mode codelist
+      2. global submission_value search across all codelists
+      3. partial submission_value match
+      4. hardcoded fallback (CTTerm_000139)
+    """
+    # 1. Within the Visit Contact Mode codelist
+    resolver = getattr(ct, "resolve_by_submission_value", None)
+    if callable(resolver):
+        hit = resolver("Visit Contact Mode", "ONSITE")
+        if hit and hit.get("term_uid"):
+            logger.info("ONSITE contact mode resolved within Visit Contact Mode: %s", hit["term_uid"])
+            return hit["term_uid"]
+
+    # 2. Global exact submission match
+    global_resolver = getattr(ct, "resolve_global_by_submission", None)
+    if callable(global_resolver):
+        hit = global_resolver("ONSITE")
+        if hit and hit.get("term_uid"):
+            logger.info("ONSITE contact mode resolved via global submission lookup: %s", hit["term_uid"])
+            return hit["term_uid"]
+
+    # 3. Global partial submission match
+    partial_resolver = getattr(ct, "resolve_global_by_partial_submission", None)
+    if callable(partial_resolver):
+        hit = partial_resolver("ONSITE")
+        if hit and hit.get("term_uid"):
+            logger.info("ONSITE contact mode resolved via global partial match: %s", hit["term_uid"])
+            return hit["term_uid"]
+
+    logger.info("ONSITE contact mode not found dynamically — using fallback %s", fallback)
+    return fallback
+
+
+def build_visit_link_index(design: dict) -> dict:
+    """
+    Single source of truth for the epoch ↔ encounter ↔ timeline ↔ timing ↔
+    instance graph.
+
+    Walks every scheduleTimeline (main and sub) once and produces an index
+    that downstream callers can read without re-parsing the USDM tree.
+
+    Returned keys:
+      encounters_by_id              {encounter_id: encounter_dict}
+      epochs_by_id                  {epoch_id: epoch_dict}
+      epoch_order                   [epoch_id, ...]   declaration order
+      instances_by_id               {instance_id: instance_dict}      (all timelines)
+      timing_by_from_instance       {instance_id: timing_dict}        (all timelines)
+      main_instance_to_encounter    {instance_id: encounter_id}
+      main_instance_to_epoch        {instance_id: epoch_id}
+      encounter_to_main_instance    {encounter_id: instance_id}
+      encounter_to_epoch            {encounter_id: epoch_id}
+      epoch_encounters              {epoch_id: [encounter_id, ...]}   in main-timeline order
+      global_anchor_instance_id     instance_id of the Fixed Reference timing, or None
+      global_anchor_encounter_id    encounter_id linked to that instance, or None
+      sub_timeline_by_main_instance {main_instance_id: sub_timeline_id}
+                                    where the main instance points at a sub-timeline
+                                    (instance.timelineId is set)
+    """
+    encounters_by_id = {e["id"]: e for e in design.get("encounters", [])}
+    epochs_by_id = {ep["id"]: ep for ep in design.get("epochs", [])}
+    epoch_order = [ep.get("id", "") for ep in design.get("epochs", [])]
+
+    instances_by_id: dict[str, dict] = {}
+    timing_by_from_instance: dict[str, dict] = {}
+    main_instance_to_encounter: dict[str, str] = {}
+    main_instance_to_epoch: dict[str, str] = {}
+    encounter_to_main_instance: dict[str, str] = {}
+    encounter_to_epoch: dict[str, str] = {}
+    sub_timeline_by_main_instance: dict[str, str] = {}
+    main_timeline_instance_order: list[str] = []
+    global_anchor_instance_id: str | None = None
 
     for tl in design.get("scheduleTimelines", []):
-        # Only use main timeline for epoch linkage
-        is_main = tl.get("mainTimeline", False)
+        is_main = bool(tl.get("mainTimeline", False))
 
-        # Build instance -> timing map from timings
+        # Index every instance (main + sub) by id
+        for inst in tl.get("instances", []):
+            inst_id = inst.get("id", "")
+            if not inst_id:
+                continue
+            instances_by_id[inst_id] = inst
+
+            if is_main:
+                main_timeline_instance_order.append(inst_id)
+                enc_id = inst.get("encounterId", "") or ""
+                epoch_id = inst.get("epochId", "") or ""
+                if enc_id:
+                    # First main-timeline instance for an encounter wins
+                    encounter_to_main_instance.setdefault(enc_id, inst_id)
+                    encounter_to_epoch.setdefault(enc_id, epoch_id)
+                    main_instance_to_encounter[inst_id] = enc_id
+                    main_instance_to_epoch[inst_id] = epoch_id
+                sub_tl_id = inst.get("timelineId") or None
+                if sub_tl_id:
+                    sub_timeline_by_main_instance[inst_id] = sub_tl_id
+
+        # Index every timing (across ALL timelines) by its "from" instance.
+        # The "from" instance is the visit being timed; "to" is the reference.
         for timing in tl.get("timings", []):
             from_id = timing.get("relativeFromScheduledInstanceId", "")
             if from_id:
-                instance_to_timing[from_id] = timing
+                timing_by_from_instance[from_id] = timing
 
-        if is_main:
-            for inst in tl.get("instances", []):
-                enc_id = inst.get("encounterId", "")
-                epoch_id = inst.get("epochId", "")
-                inst_id = inst.get("id", "")
-                if enc_id:
-                    enc_to_epoch[enc_id] = epoch_id
-                    enc_to_instance[enc_id] = inst_id
+            if is_main and global_anchor_instance_id is None:
+                ttype = timing.get("type", {}).get("decode", "")
+                if ttype.lower() == "fixed reference":
+                    global_anchor_instance_id = timing.get("relativeFromScheduledInstanceId") or None
 
-    return enc_to_epoch, enc_to_instance, instance_to_timing
+    global_anchor_encounter_id = (
+        main_instance_to_encounter.get(global_anchor_instance_id)
+        if global_anchor_instance_id else None
+    )
+    if global_anchor_instance_id:
+        logger.info(
+            "Global anchor: instance=%s encounter=%s (Fixed Reference)",
+            global_anchor_instance_id, global_anchor_encounter_id,
+        )
+
+    # ── Label/description parsing ────────────────────────────────────────
+    # Parse the slash-delimited label/description on each encounter (and its
+    # linking main-timeline instance, if any). This gives us a fallback
+    # source for: epoch linkage, time value, and window.
+    parsed_label_by_encounter: dict[str, dict] = {}
+    for enc_id, enc in encounters_by_id.items():
+        link_inst = instances_by_id.get(encounter_to_main_instance.get(enc_id, ""))
+        parsed_label_by_encounter[enc_id] = parse_visit_label_text(
+            _pick_label_text(link_inst, enc)
+        )
+
+    # Build epoch_name -> epoch_id index for the by-name fallback.
+    epoch_name_to_id: dict[str, str] = {}
+    for ep_id, ep in epochs_by_id.items():
+        for key in ("label", "name"):
+            n = (ep.get(key) or "").strip().lower()
+            if n:
+                epoch_name_to_id.setdefault(n, ep_id)
+
+    # Recover epoch linkage for encounters that have no instance.epochId by
+    # matching the parsed epoch_name against the design's epochs.
+    for enc_id, parsed in parsed_label_by_encounter.items():
+        if enc_id in encounter_to_epoch and encounter_to_epoch[enc_id]:
+            continue
+        ep_name = parsed.get("epoch_name")
+        if not ep_name:
+            continue
+        ep_id = epoch_name_to_id.get(ep_name.strip().lower())
+        if not ep_id:
+            # Tolerate trailing words like "Screening Phase" vs "Screening"
+            for known_name, known_id in epoch_name_to_id.items():
+                if known_name in ep_name.lower() or ep_name.lower() in known_name:
+                    ep_id = known_id
+                    break
+        if ep_id:
+            encounter_to_epoch[enc_id] = ep_id
+            logger.info(
+                "Encounter '%s' linked to epoch '%s' via parsed label epoch_name='%s'",
+                enc_id, ep_id, ep_name,
+            )
+
+    # Group encounters by epoch — main-timeline order first, then any
+    # encounters that were linked only via parsed label.
+    epoch_encounters: dict[str, list[str]] = {eid: [] for eid in epoch_order}
+    seen_encs: set[str] = set()
+    for inst_id in main_timeline_instance_order:
+        enc_id = main_instance_to_encounter.get(inst_id)
+        if not enc_id or enc_id in seen_encs:
+            continue
+        epoch_id = main_instance_to_epoch.get(inst_id) or encounter_to_epoch.get(enc_id)
+        if epoch_id and epoch_id in epoch_encounters:
+            epoch_encounters[epoch_id].append(enc_id)
+            seen_encs.add(enc_id)
+    for enc_id, epoch_id in encounter_to_epoch.items():
+        if enc_id in seen_encs or not epoch_id:
+            continue
+        if epoch_id in epoch_encounters:
+            epoch_encounters[epoch_id].append(enc_id)
+            seen_encs.add(enc_id)
+
+    # Final pass: encounters still unlinked after structural + label fallback.
+    for enc_id in encounters_by_id:
+        if enc_id not in encounter_to_main_instance and enc_id not in encounter_to_epoch:
+            logger.warning(
+                "Encounter '%s' not linked via main-timeline instance OR parsed label",
+                enc_id,
+            )
+
+    return {
+        "encounters_by_id": encounters_by_id,
+        "epochs_by_id": epochs_by_id,
+        "epoch_order": epoch_order,
+        "instances_by_id": instances_by_id,
+        "timing_by_from_instance": timing_by_from_instance,
+        "main_instance_to_encounter": main_instance_to_encounter,
+        "main_instance_to_epoch": main_instance_to_epoch,
+        "encounter_to_main_instance": encounter_to_main_instance,
+        "encounter_to_epoch": encounter_to_epoch,
+        "epoch_encounters": epoch_encounters,
+        "global_anchor_instance_id": global_anchor_instance_id,
+        "global_anchor_encounter_id": global_anchor_encounter_id,
+        "sub_timeline_by_main_instance": sub_timeline_by_main_instance,
+        "parsed_label_by_encounter": parsed_label_by_encounter,
+    }
+
+
+# Backward-compatible thin wrappers — keep the old names callable in case
+# anything imports them. They delegate to build_visit_link_index().
+
+def _build_instance_maps(design: dict) -> tuple[dict, dict, dict]:
+    idx = build_visit_link_index(design)
+    return (
+        dict(idx["encounter_to_epoch"]),
+        dict(idx["encounter_to_main_instance"]),
+        dict(idx["timing_by_from_instance"]),
+    )
 
 
 def _determine_global_anchor(design: dict) -> str | None:
-    """
-    Find the global anchor encounter — the one whose timing type decode is
-    "Fixed Reference" in the main timeline.  This is typically Day 1 / Dosing.
-    Returns the encounter_id or None.
-    """
-    for tl in design.get("scheduleTimelines", []):
-        if not tl.get("mainTimeline", False):
-            continue
-        for timing in tl.get("timings", []):
-            timing_type = timing.get("type", {}).get("decode", "")
-            if timing_type.lower() == "fixed reference":
-                # The "from" instance is the anchor
-                inst_id = timing.get("relativeFromScheduledInstanceId", "")
-                # Find the encounter for this instance
-                for inst in tl.get("instances", []):
-                    if inst.get("id") == inst_id:
-                        anchor_enc = inst.get("encounterId", "")
-                        logger.info("Global anchor: instance=%s encounter=%s (Fixed Reference)",
-                                    inst_id, anchor_enc)
-                        return anchor_enc
-    return None
+    return build_visit_link_index(design)["global_anchor_encounter_id"]
 
 
 def _get_timing_for_encounter(
@@ -589,7 +1118,6 @@ def _get_timing_for_encounter(
     enc_to_instance: dict[str, str],
     instance_to_timing: dict[str, dict],
 ) -> dict | None:
-    """Get the timing dict associated with an encounter via its instance."""
     inst_id = enc_to_instance.get(enc_id, "")
     return instance_to_timing.get(inst_id)
 
@@ -614,40 +1142,30 @@ def map_visits_grouped_by_epoch(
     Returns visits ordered by epoch, so the caller can post them
     epoch-by-epoch.
     """
-    encounters_by_id = {e["id"]: e for e in design.get("encounters", [])}
+    # Single dynamic linkage index — replaces ad-hoc per-call traversals.
+    idx = build_visit_link_index(design)
+    encounters_by_id = idx["encounters_by_id"]
+    epochs_by_id = idx["epochs_by_id"]
+    timing_by_from_instance = idx["timing_by_from_instance"]
+    encounter_to_main_instance = idx["encounter_to_main_instance"]
+    epoch_order = idx["epoch_order"]
+    epoch_encounters = idx["epoch_encounters"]
+    global_anchor_enc_id = idx["global_anchor_encounter_id"]
+    parsed_label_by_encounter = idx["parsed_label_by_encounter"]
 
-    # Build linkage maps from scheduleTimeline instances
-    enc_to_epoch, enc_to_instance, instance_to_timing = _build_instance_maps(design)
-
-    # Determine global anchor encounter
-    global_anchor_enc_id = _determine_global_anchor(design)
-
-    # Resolve the time_reference_uid for the global anchor visit
-    # The OSB API requires this — submission value "GLOBAL ANCHOR VISIT REFERENCE"
+    # Resolve the time_reference_uid for the global anchor visit.
+    # The OSB API requires this — submission value "GLOBAL ANCHOR VISIT REFERENCE".
     global_anchor_ref = ct.resolve("Time Reference", decode="Global Anchor Visit Reference")
     if not global_anchor_ref:
-        # Try direct submission value search across all codelists
         global_anchor_ref = ct.resolve_global_by_submission("GLOBAL ANCHOR VISIT REFERENCE")
     if not global_anchor_ref:
-        # Broadest fallback — partial match
         global_anchor_ref = ct.resolve_global_by_partial_submission("Global Anchor Visit")
     global_anchor_ref_uid = global_anchor_ref["term_uid"] if global_anchor_ref else None
     logger.info("Global anchor time_reference_uid: %s", global_anchor_ref_uid)
 
-    # Group encounters by epoch (preserving order)
-    epoch_order = [ep.get("id", "") for ep in design.get("epochs", [])]
-    epoch_encounters: dict[str, list[str]] = {eid: [] for eid in epoch_order}
-    for enc_id, epoch_id in enc_to_epoch.items():
-        if epoch_id in epoch_encounters:
-            epoch_encounters[epoch_id].append(enc_id)
-
-    # Also catch any encounters not linked via instances (fallback)
-    linked_enc_ids = set(enc_to_epoch.keys())
-    for enc in design.get("encounters", []):
-        enc_id = enc.get("id", "")
-        if enc_id not in linked_enc_ids:
-            # Try scheduledAtId or just assign to first epoch
-            logger.warning("Encounter '%s' not linked via timeline instances", enc_id)
+    # Resolve the ONSITE fallback once (used when an encounter has no contactMode
+    # or the dynamic codelist lookup fails).
+    onsite_fallback_uid = _resolve_onsite_contact_mode_uid(ct)
 
     result = []
     for epoch_id in epoch_order:
@@ -660,17 +1178,24 @@ def map_visits_grouped_by_epoch(
                 continue
 
             label = enc.get("label", enc.get("name", ""))
+            epoch_obj = epochs_by_id.get(epoch_id, {})
+            epoch_name = epoch_obj.get("label") or epoch_obj.get("name") or ""
 
-            # ── Visit type: resolve dynamically (no hardcoded fallback) ──
+            # ── Visit type: resolve dynamically ──
+            #   1. encounter.type code/decode (often "Visit", rarely useful)
+            #   2. encounter label as decode
+            #   3. EPOCH NAME match against Visit Type sponsor_preferred_name
+            #      (Screening epoch -> SCREEN VISIT TYPE / "Screening", etc.)
             type_code, type_decode = _code_obj(enc.get("type"))
             visit_type = ct.resolve("Visit Type", code=type_code, decode=type_decode)
             if not visit_type:
-                # Try the label itself as decode for fuzzy matching
                 visit_type = ct.resolve("Visit Type", decode=label)
-            logger.info("  Visit '%s': type code=%s decode='%s' -> %s",
-                        label, type_code, type_decode, visit_type)
+            if not visit_type and epoch_name:
+                visit_type = _resolve_visit_type_for_epoch(ct, epoch_name)
+            logger.info("  Visit '%s' (epoch='%s'): type code=%s decode='%s' -> %s",
+                        label, epoch_name, type_code, type_decode, visit_type)
 
-            # ── Contact mode: search decode text within Visit Contact Mode codelist ──
+            # ── Contact mode: prefer per-encounter codelist match, fall back to ONSITE ──
             contact_mode_uid = None
             contact_modes = enc.get("contactModes", [])
             if contact_modes:
@@ -678,9 +1203,16 @@ def map_visits_grouped_by_epoch(
                 contact_mode_uid = _resolve_contact_mode(ct, cm_code, cm_decode)
                 logger.info("  Visit '%s': contactMode code=%s decode='%s' -> uid=%s",
                             label, cm_code, cm_decode, contact_mode_uid)
+            if not contact_mode_uid:
+                contact_mode_uid = onsite_fallback_uid
+                logger.info("  Visit '%s': contactMode fallback -> %s", label, contact_mode_uid)
 
-            # ── Timing from scheduleTimeline ──
-            timing = _get_timing_for_encounter(enc_id, enc_to_instance, instance_to_timing)
+            # ── Timing from scheduleTimeline (via the encounter's main-timeline instance) ──
+            inst_id = encounter_to_main_instance.get(enc_id, "")
+            timing = timing_by_from_instance.get(inst_id) if inst_id else None
+            parsed = parsed_label_by_encounter.get(enc_id, {})
+            time_from_record = False
+            window_from_record = False
             time_value = 0
             time_unit = "day"
             min_window = None
@@ -699,6 +1231,7 @@ def map_visits_grouped_by_epoch(
                     else:
                         time_value = int(parsed_val)
                     time_unit = parsed_unit
+                    time_from_record = True
 
                 # Parse window bounds
                 wl = timing.get("windowLower", "")
@@ -708,15 +1241,30 @@ def map_visits_grouped_by_epoch(
                     if wl_val is not None:
                         min_window = -abs(int(wl_val))  # lower bound is typically negative
                         window_unit = wl_unit
+                        window_from_record = True
                 if wu:
                     wu_val, wu_unit = _parse_iso8601_duration(wu)
                     if wu_val is not None:
                         max_window = int(wu_val)
                         window_unit = window_unit or wu_unit
+                        window_from_record = True
 
                 logger.info("  Visit '%s': timing value=%s -> %d %s, window=[%s, %s]",
                             label, raw_value, time_value, time_unit,
                             min_window, max_window)
+
+            # ── Fallback to parsed label/description when timing is missing ──
+            if not time_from_record and parsed.get("time_value") is not None:
+                time_value = int(parsed["time_value"])
+                time_unit = parsed.get("time_unit") or time_unit
+                logger.info("  Visit '%s': time recovered from label -> %d %s",
+                            label, time_value, time_unit)
+            if not window_from_record and parsed.get("window_lower") is not None:
+                min_window = parsed["window_lower"]
+                max_window = parsed["window_upper"]
+                window_unit = parsed.get("window_unit") or window_unit
+                logger.info("  Visit '%s': window recovered from label -> [%s, %s] %s",
+                            label, min_window, max_window, window_unit)
 
             # Resolve time unit
             unit_def = ct.resolve_unit(time_unit)
@@ -761,9 +1309,11 @@ def map_visits_grouped_by_epoch(
                 "visit_subclass": "SINGLE_VISIT",
                 "is_global_anchor_visit": is_anchor,
                 "is_soa_milestone": False,
-                # Stash for logging
+                # Stash for logging / downstream diagnostics
                 "_label": label,
                 "_epoch_id": epoch_id,
+                "_parsed_visit_number": parsed.get("visit_number"),
+                "_parsed_epoch_name": parsed.get("epoch_name"),
             })
 
     logger.info("Mapped %d visits across %d epochs", len(result), len(epoch_order))
@@ -791,7 +1341,11 @@ def map_objectives(design: dict, ct: CTResolver) -> list[dict]:
     for obj in design.get("objectives", []):
         level_decode = obj.get("level", {}).get("decode", "")
         level_code = obj.get("level", {}).get("code", "")
-        resolved_level = ct.resolve("Objective Level", code=level_code, decode=level_decode)
+        resolved_level = ct.resolve("Objective Level", code=level_code, decode=level_decode, strict=True)
+        if resolved_level and not ct.term_is_in_codelist(resolved_level.get("term_uid"), "Objective Level"):
+            logger.warning("  Objective level term %s ('%s') is NOT in Objective Level codelist — discarding",
+                           resolved_level.get("term_uid"), resolved_level.get("name"))
+            resolved_level = None
 
         level_uid = resolved_level["term_uid"] if resolved_level else None
         level_name = resolved_level["name"] if resolved_level else level_decode
@@ -816,30 +1370,79 @@ def map_objectives(design: dict, ct: CTResolver) -> list[dict]:
 
 # ── eligibility criteria ─────────────────────────────────────────────────────
 
+def _classify_criterion_category(decode: str) -> str:
+    """
+    Classify a criterion's category.decode into one of:
+      'inclusion', 'exclusion', 'withdrawal', 'run-in', 'other'.
+
+    Recognizes phrases like "Inclusion Criteria", "Exclusion Criteria",
+    "Withdrawal Criteria", "Run-in Criteria".
+    """
+    d = (decode or "").lower().strip()
+    if "withdraw" in d:
+        return "withdrawal"
+    if "run-in" in d or "run in" in d:
+        return "run-in"
+    if d.startswith("ex") or "exclusion" in d:
+        return "exclusion"
+    if d.startswith("in") or "inclusion" in d:
+        return "inclusion"
+    return "other"
+
+
 def map_criteria(version: dict, design: dict, ct: CTResolver) -> list[dict]:
     """
-    Build criteria list with type (inclusion/exclusion) resolved dynamically.
+    Build criteria list with type resolved dynamically from the Criteria Type
+    codelist. Supports inclusion / exclusion / withdrawal / run-in.
+
+    Resolution path for each criterion:
+      1. ct.resolve("Criteria Type", code=category.code, decode=category.decode)
+         — exact concept_id and exact submission_value/sponsor name lookup
+      2. Fallback to a sponsor-name decode like "Inclusion Criteria"
+      3. None if still no match (logged)
     """
-    # Build text map from eligibilityCriterionItems
     criterion_items = version.get("eligibilityCriterionItems", [])
     text_map = {c["id"]: c.get("text", "") for c in criterion_items}
 
     result = []
     for crit in design.get("eligibilityCriteria", []):
-        cat = crit.get("category", {}).get("decode", "").lower()
+        cat_decode = crit.get("category", {}).get("decode", "")
         cat_code = crit.get("category", {}).get("code", "")
-        is_inclusion = cat.startswith("in")
+        crit_type = _classify_criterion_category(cat_decode)
 
-        # Resolve type dynamically
-        search = "Inclusion" if is_inclusion else "Exclusion"
-        resolved = ct.resolve("Criteria Type", code=cat_code, decode=search)
+        # 1. Try with the actual USDM decode (e.g. "Inclusion Criteria")
+        resolved = ct.resolve("Criteria Type", code=cat_code, decode=cat_decode, strict=True)
+
+        # 2. Fallback to canonical sponsor-name form
+        if not resolved:
+            fallback_decode = {
+                "inclusion": "Inclusion Criteria",
+                "exclusion": "Exclusion Criteria",
+                "withdrawal": "Withdrawal Criteria",
+                "run-in": "Run-in Criteria",
+            }.get(crit_type)
+            if fallback_decode:
+                resolved = ct.resolve("Criteria Type", decode=fallback_decode, strict=True)
+
+        # 3. Validate the term actually belongs to Criteria Type codelist
+        if resolved and not ct.term_is_in_codelist(resolved.get("term_uid"), "Criteria Type"):
+            logger.warning("  Criteria type term %s ('%s') is NOT in Criteria Type codelist — discarding",
+                           resolved.get("term_uid"), resolved.get("name"))
+            resolved = None
+
+        if resolved:
+            logger.info("  Criterion category code=%s decode='%s' -> '%s' (%s)",
+                        cat_code, cat_decode, resolved.get("name"), resolved.get("term_uid"))
+        else:
+            logger.warning("  Criterion category code=%s decode='%s' (type=%s) NOT RESOLVED in Criteria Type codelist",
+                           cat_code, cat_decode, crit_type)
 
         item_id = crit.get("criterionItemId", crit.get("id", ""))
         raw_text = text_map.get(item_id, crit.get("text", ""))
 
         result.append({
             "id": item_id,
-            "type": "inclusion" if is_inclusion else "exclusion",
+            "type": crit_type,
             "type_uid": resolved["term_uid"] if resolved else None,
             "text": raw_text,
         })

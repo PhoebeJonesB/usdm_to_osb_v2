@@ -38,8 +38,13 @@ CODELIST_ALIASES: dict[str, list[str]] = {
     "trial blinding schema":   ["trial blinding schema response"],
     "trial intent type":       ["trial intent type response"],
     "intervention model":      ["intervention model response"],
+    "intervention type":       ["intervention type response"],
+    "control type":            ["control type response"],
     "sex":                     ["sex of participants response"],
-    "endpoint level":          ["endpoint sub level"],
+    # NOTE: "endpoint level" and "endpoint sub level" are SEPARATE codelists
+    # with overlapping term names ("Primary", "Secondary", …). Aliasing them
+    # caused term_uids to leak across codelists, producing OSB 400s like
+    # "term ... was not found in the codelist ...". Keep them separate.
 }
 
 
@@ -139,21 +144,34 @@ class CTResolver:
 
         logger.info("Indexed %d codelists, %d global submission entries",
                      len(self._codelist_uids), len(self._global_all_submissions))
+        # Audit log so callers can verify critical codelists were loaded.
+        for critical in ("Endpoint Level", "Objective Level", "Criteria Type",
+                         "Visit Type", "Visit Contact Mode"):
+            key = _normalize_codelist_key(critical)
+            present = key in self._codelist_uids
+            display = self._codelist_display_names.get(key, "—")
+            n = len(self._by_codelist_name.get(key, {}))
+            logger.info("  CT codelist '%s' loaded=%s (display=%r, %d terms)",
+                        critical, present, display, n)
 
     # ── codelist key resolution ───────────────────────────────────────────
 
-    def _codelist_keys(self, codelist_name: str) -> list[str]:
+    def _codelist_keys(self, codelist_name: str, strict: bool = False) -> list[str]:
         """
         Return the normalized key plus any aliases, so resolve() can try them all.
 
-        Also tries fuzzy matching against known codelist names in case of
-        typos or naming differences not covered by aliases.
+        When ``strict=False`` (default) and the primary key isn't loaded, also
+        tries fuzzy matching against known codelist names — convenient for
+        typos but DANGEROUS for fields where the wrong codelist returns a
+        valid-looking but wrong term (e.g. Endpoint Level vs Objective Level).
+
+        When ``strict=True``, only the primary normalized key plus explicit
+        aliases are tried — no fuzzy codelist fallback.
         """
         primary = _normalize_codelist_key(codelist_name)
         keys = [primary]
 
-        # Check if primary exists in our index; if not, fuzzy-match against known keys
-        if primary not in self._codelist_uids:
+        if not strict and primary not in self._codelist_uids:
             known_keys = list(self._codelist_uids.keys())
             fuzzy = get_close_matches(primary, known_keys, n=1, cutoff=0.75)
             if fuzzy and fuzzy[0] not in keys:
@@ -167,6 +185,27 @@ class CTResolver:
                 keys.append(alt)
 
         return keys
+
+    def term_is_in_codelist(self, term_uid: str, codelist_name: str) -> bool:
+        """
+        Verify that ``term_uid`` is registered under EXACTLY ``codelist_name``.
+
+        Used to validate a resolved term before posting. Only the primary
+        normalized key is checked — aliases are deliberately NOT expanded,
+        because aliases like "endpoint level" ↔ "endpoint sub level" point
+        at different codelists with overlapping term names. We need the
+        strict "is this term in THIS specific codelist" answer.
+        """
+        if not term_uid:
+            return False
+        cl_key = _normalize_codelist_key(codelist_name)
+        for bucket in (self._by_codelist_name.get(cl_key, {}),
+                       self._by_codelist_submission.get(cl_key, {}),
+                       self._by_codelist_concept.get(cl_key, {})):
+            for info in bucket.values():
+                if info.get("term_uid") == term_uid:
+                    return True
+        return False
 
     def get_codelist_uid(self, codelist_name: str) -> str | None:
         for key in self._codelist_keys(codelist_name):
@@ -309,7 +348,8 @@ class CTResolver:
 
     # ── main resolve method ───────────────────────────────────────────────
 
-    def resolve(self, codelist_name: str, code: str = "", decode: str = "") -> dict | None:
+    def resolve(self, codelist_name: str, code: str = "", decode: str = "",
+                strict: bool = False) -> dict | None:
         """
         Resolve within named codelist + aliases only (no global fallback).
 
@@ -321,11 +361,15 @@ class CTResolver:
           5. fuzzy sponsor_preferred_name
           6. fuzzy submission_value
 
+        When ``strict=True``, the fuzzy CODELIST fallback is disabled — useful
+        for fields like endpoint_level where matching the wrong codelist
+        produces a term that OSB rejects at validation time.
+
         Returns {"term_uid": ..., "name": ..., "submission_value": ...} or None.
         """
         primary = _normalize_codelist_key(codelist_name)
 
-        for cl_key in self._codelist_keys(codelist_name):
+        for cl_key in self._codelist_keys(codelist_name, strict=strict):
             cl_display = self._codelist_display_names.get(cl_key, cl_key)
 
             if code:

@@ -154,7 +154,7 @@ def run_upload(config: Config, usdm_path: str, skip_sections: set[str] | None = 
             "study_description": mappers.map_study_description(version),
             "high_level_study_design": mappers.map_high_level_design(design, ct),
             "study_population": mappers.map_study_population(design, ct),
-            "study_intervention": mappers.map_study_intervention(design, ct),
+            "study_intervention": mappers.map_study_intervention(design, ct, version),
         }
         ok = uploaders.patch_study_metadata(api, study_uid, metadata)
         results["sections"]["metadata"] = "success" if ok else "FAILED"

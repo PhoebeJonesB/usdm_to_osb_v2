@@ -305,8 +305,13 @@ _CODELIST_ALIASES = {
     "trialblindingschema":  ["trialblindingschemaresponse"],
     "trialintenttype":      ["trialintenttyperesponse"],
     "interventionmodel":    ["interventionmodelresponse"],
+    "interventiontype":     ["interventiontyperesponse"],
+    "controltype":          ["controltyperesponse"],
     "sex":                  ["sexofparticipantsresponse"],
-    "endpointlevel":        ["endpointsublevel"],
+    # NOTE: "endpoint level" and "endpoint sub level" are SEPARATE codelists
+    # with overlapping term names ("Primary", "Secondary", …). Aliasing them
+    # caused term_uids to leak across codelists, producing OSB 400s like
+    # "term ... was not found in the codelist ...". Keep them separate.
 }
 
 
@@ -366,12 +371,28 @@ class CTResolver:
                     self._by_codelist_submission.setdefault(cl_key, {})[sub_val.lower().strip()] = cl_info
 
         log.info("Indexed %d codelists.", len(self._codelist_uids))
+        # Audit log so callers can verify critical codelists were loaded.
+        for critical in ("Endpoint Level", "Objective Level", "Criteria Type",
+                         "Visit Type", "Visit Contact Mode"):
+            key = _normalize_codelist_key(critical)
+            present = key in self._codelist_uids
+            display = self._codelist_display_names.get(key, "—")
+            n = len(self._by_codelist_name.get(key, {}))
+            log.info("  CT codelist '%s' loaded=%s (display=%r, %d terms)",
+                     critical, present, display, n)
 
-    def _codelist_keys(self, codelist_name):
+    def _codelist_keys(self, codelist_name, strict=False):
+        """Return primary normalized key + aliases.
+
+        When strict=False (default) and the primary key isn't loaded, also
+        fuzzy-matches against known codelist names. strict=True disables that
+        fallback — required for fields where the wrong codelist returns a
+        valid-looking but wrong term (e.g. Endpoint Level vs Objective Level).
+        """
         primary = _normalize_codelist_key(codelist_name)
         keys = [primary]
 
-        if primary not in self._codelist_uids:
+        if not strict and primary not in self._codelist_uids:
             known = list(self._codelist_uids.keys())
             fuzzy = get_close_matches(primary, known, n=1, cutoff=0.75)
             if fuzzy and fuzzy[0] not in keys:
@@ -383,6 +404,24 @@ class CTResolver:
             if alt not in keys:
                 keys.append(alt)
         return keys
+
+    def term_is_in_codelist(self, term_uid, codelist_name):
+        """Verify ``term_uid`` is registered under EXACTLY ``codelist_name``.
+
+        Only the primary normalized key is checked — aliases are not expanded,
+        because they may point at different codelists with overlapping term
+        names. We need the strict 'is this term in THIS specific codelist' answer.
+        """
+        if not term_uid:
+            return False
+        cl_key = _normalize_codelist_key(codelist_name)
+        for bucket in (self._by_codelist_name.get(cl_key, {}),
+                       self._by_codelist_submission.get(cl_key, {}),
+                       self._by_codelist_concept.get(cl_key, {})):
+            for info in bucket.values():
+                if info.get("term_uid") == term_uid:
+                    return True
+        return False
 
     def _resolve_by_partial_submission(self, cl_key, text):
         bucket = self._by_codelist_submission.get(cl_key, {})
@@ -410,10 +449,10 @@ class CTResolver:
             return bucket[matches[0]]
         return None
 
-    def resolve(self, codelist_name, code="", decode=""):
+    def resolve(self, codelist_name, code="", decode="", strict=False):
         primary = _normalize_codelist_key(codelist_name)
 
-        for cl_key in self._codelist_keys(codelist_name):
+        for cl_key in self._codelist_keys(codelist_name, strict=strict):
             cl_display = self._codelist_display_names.get(cl_key, cl_key)
 
             if code:
@@ -484,6 +523,49 @@ class CTResolver:
             if bucket:
                 return list(bucket.values())
         return []
+
+    def resolve_by_submission_value(self, codelist_name, value):
+        """Exact submission_value match within one codelist."""
+        if not value:
+            return None
+        target = value.lower().strip()
+        for key in self._codelist_keys(codelist_name):
+            bucket = self._by_codelist_submission.get(key, {})
+            if target in bucket:
+                return bucket[target]
+        return None
+
+    def resolve_by_submission_global(self, value):
+        """
+        Search the given submission_value across every indexed codelist.
+        Exact match first, then partial/contains.
+        Returns {"term_uid": ..., "name": ..., "submission_value": ...} or None.
+        """
+        if not value:
+            return None
+        target = value.lower().strip()
+
+        # Exact across all codelists
+        for cl_key, bucket in self._by_codelist_submission.items():
+            if target in bucket:
+                hit = bucket[target]
+                log.info("  Submission '%s' resolved in codelist '%s' -> %s",
+                         value, self._codelist_display_names.get(cl_key, cl_key), hit["term_uid"])
+                return hit
+
+        # Partial/contains across all codelists, longest match wins
+        best = None
+        best_len = 0
+        best_cl = None
+        for cl_key, bucket in self._by_codelist_submission.items():
+            for sub_val, info in bucket.items():
+                if sub_val in target or target in sub_val:
+                    if len(sub_val) > best_len:
+                        best, best_len, best_cl = info, len(sub_val), cl_key
+        if best:
+            log.info("  Submission '%s' resolved partially in codelist '%s' -> %s",
+                     value, self._codelist_display_names.get(best_cl, best_cl), best["term_uid"])
+        return best
 
 
 ct = None  # Initialized in main()
@@ -599,6 +681,70 @@ def create_study(parsed_refs):
 # CELL 9 - METADATA PATCH
 # ==============================================================================
 
+_REGISTRY_ID_FIELDS = (
+    "ct_gov_id",
+    "eudract_id",
+    "universal_trial_number_utn",
+    "japanese_trial_registry_id_japic",
+    "investigational_new_drug_application_number_ind",
+    "eu_trial_number",
+    "civ_id_sin_number",
+    "national_clinical_trial_number",
+    "japanese_trial_registry_number_jrct",
+    "national_medical_products_administration_nmpa_number",
+    "eudamed_srn_number",
+    "investigational_device_exemption_ide_number",
+    "eu_pas_number",
+)
+
+_REGISTRY_SCOPE_RULES = (
+    ("ct_gov_id",                                          {"keywords": ("clinicaltrials.gov", "ct.gov", "clinicaltrials"), "prefix": ("NCT",)}),
+    ("eudract_id",                                         {"keywords": ("eudract",),                                       "regex": r"^\d{4}-\d{6}-\d{2}$"}),
+    ("universal_trial_number_utn",                         {"keywords": ("universal trial number", "utn", "who utn"),       "prefix": ("U1111-",)}),
+    ("japanese_trial_registry_id_japic",                   {"keywords": ("japic",),                                         "prefix": ("JapicCTI-", "JAPIC")}),
+    ("investigational_new_drug_application_number_ind",    {"keywords": ("investigational new drug", " ind ", "ind number")}),
+    ("eu_trial_number",                                    {"keywords": ("eu trial number", "ctis", "ct-")}),
+    ("civ_id_sin_number",                                  {"keywords": ("civ-id", "sin number")}),
+    ("national_clinical_trial_number",                     {"keywords": ("national clinical trial",)}),
+    ("japanese_trial_registry_number_jrct",                {"keywords": ("jrct",),                                          "prefix": ("jRCT", "JRCT")}),
+    ("national_medical_products_administration_nmpa_number", {"keywords": ("nmpa",)}),
+    ("eudamed_srn_number",                                 {"keywords": ("eudamed", "srn")}),
+    ("investigational_device_exemption_ide_number",        {"keywords": ("ide number", "investigational device")}),
+    ("eu_pas_number",                                      {"keywords": ("eu pas", "encepp", "pas number")}),
+)
+
+
+def _classify_registry_identifier(ident):
+    """Two-pass routing: org-name keywords first, then text prefix/regex,
+    finally text-keyword fallback. Prevents 'NCT-NAT-...' from being misrouted
+    to ct_gov_id just because it starts with 'NCT'."""
+    text = (ident.get("text") or "").strip()
+    scope = ident.get("scope") or {}
+    org = scope.get("organization") if isinstance(scope, dict) else None
+    org_name = (org.get("name") if isinstance(org, dict) else "") or ""
+    org_haystack = org_name.lower()
+
+    for field, rule in _REGISTRY_SCOPE_RULES:
+        for kw in rule.get("keywords", ()):
+            if kw in org_haystack:
+                return field
+
+    for field, rule in _REGISTRY_SCOPE_RULES:
+        for prefix in rule.get("prefix", ()):
+            if text.startswith(prefix):
+                return field
+        rgx = rule.get("regex")
+        if rgx and re.match(rgx, text):
+            return field
+
+    text_haystack = text.lower()
+    for field, rule in _REGISTRY_SCOPE_RULES:
+        for kw in rule.get("keywords", ()):
+            if kw in text_haystack:
+                return field
+    return None
+
+
 def build_metadata_patch(parsed_refs):
     version = parsed_refs["version"]
     design = parsed_refs["design"]
@@ -608,17 +754,16 @@ def build_metadata_patch(parsed_refs):
 
     metadata = {}
 
-    ct_gov_id = None
-    eudract_id = None
+    # Verbose registry_identifiers — 13 fields + *_null_value_code companions.
+    registry = {}
+    for f in _REGISTRY_ID_FIELDS:
+        registry[f] = None
+        registry[f"{f}_null_value_code"] = None
     for ident in identifiers:
-        text = ident.get("text", "")
-        if text.startswith("NCT"):
-            ct_gov_id = text
-        elif text.startswith("20") and "-" in text:
-            eudract_id = text
-    metadata["identification_metadata"] = {
-        "registry_identifiers": {"ct_gov_id": ct_gov_id, "eudract_id": eudract_id}
-    }
+        field = _classify_registry_identifier(ident)
+        if field and not registry.get(field):
+            registry[field] = (ident.get("text") or "").strip() or None
+    metadata["identification_metadata"] = {"registry_identifiers": registry}
 
     official = brief = None
     for t in titles:
@@ -706,6 +851,36 @@ def build_metadata_patch(parsed_refs):
     if intent_types:
         interv["trial_intent_types_codes"] = ct.resolve_multiple("Trial Intent Type", intent_types) or None
         log.info("  trial_intent_types_codes: %d resolved", len(interv.get("trial_intent_types_codes") or []))
+
+    # intervention_type_code: studyDesign.interventionType wins, else first
+    # version.studyInterventions[*].type.
+    int_type_obj = design.get("interventionType")
+    if int_type_obj:
+        if isinstance(int_type_obj, dict) and "standardCode" in int_type_obj:
+            code, decode = _alias_code(int_type_obj)
+        else:
+            code, decode = _code_obj(int_type_obj)
+    else:
+        code, decode = ("", "")
+        for si in version.get("studyInterventions", []) or []:
+            code, decode = _code_obj(si.get("type"))
+            if code or decode:
+                break
+    if code or decode:
+        interv["intervention_type_code"] = ct.resolve("Intervention Type", code=code, decode=decode)
+        log.info("  intervention_type_code: code=%s decode='%s' -> %s",
+                 code, decode, interv.get("intervention_type_code"))
+
+    # control_type_code: studyDesign.controlType (synthesizer-provided)
+    ct_type_obj = design.get("controlType")
+    if ct_type_obj:
+        if isinstance(ct_type_obj, dict) and "standardCode" in ct_type_obj:
+            code, decode = _alias_code(ct_type_obj)
+        else:
+            code, decode = _code_obj(ct_type_obj)
+        interv["control_type_code"] = ct.resolve("Control Type", code=code, decode=decode)
+        log.info("  control_type_code: code=%s decode='%s' -> %s",
+                 code, decode, interv.get("control_type_code"))
 
     if interv:
         metadata["study_intervention"] = interv
@@ -996,62 +1171,436 @@ def _parse_iso8601_duration(value):
     return (None, "day")
 
 
-def _build_instance_maps(design):
-    enc_to_epoch = {}
-    enc_to_instance = {}
-    instance_to_timing = {}
+# Default OSB contact mode UID for "On Site Visit" — last-resort fallback when
+# the dynamic ONSITE submission lookup fails.
+_DEFAULT_ONSITE_CONTACT_MODE_UID = "CTTerm_000139"
+
+
+def _normalize_phrase(s):
+    return (s or "").lower().replace("-", " ").replace("_", " ").strip()
+
+
+def _resolve_visit_type_for_epoch(epoch_name):
+    """
+    Find a Visit Type term whose sponsor_preferred_name relates to the epoch name.
+    See usdm_to_osb.mappers._resolve_visit_type_for_epoch for full docs.
+    """
+    if not epoch_name or ct is None:
+        return None
+    hit = ct.resolve("Visit Type", decode=epoch_name)
+    if hit:
+        return hit
+    terms = ct.list_terms_in_codelist("Visit Type")
+    if not terms:
+        return None
+    target = _normalize_phrase(epoch_name)
+    target_words = {w for w in target.split() if len(w) >= 3}
+    best = None
+    best_score = 0
+    for term in terms:
+        name = _normalize_phrase(term.get("name", ""))
+        if not name:
+            continue
+        name_words = set(name.split())
+        common = target_words & name_words
+        if target_words and common == target_words and len(common) > best_score:
+            best, best_score = term, len(common)
+            continue
+        if best is None and (target in name or name in target):
+            best = term
+    if best:
+        log.info("  Visit type matched for epoch '%s' -> '%s' (%s)",
+                 epoch_name, best.get("name"), best.get("term_uid"))
+    return best
+
+
+def _classify_criterion_category(decode):
+    d = (decode or "").lower().strip()
+    if "withdraw" in d:
+        return "withdrawal"
+    if "run-in" in d or "run in" in d:
+        return "run-in"
+    if d.startswith("ex") or "exclusion" in d:
+        return "exclusion"
+    if d.startswith("in") or "inclusion" in d:
+        return "inclusion"
+    return "other"
+
+
+def _resolve_criteria_type_uid(cat_code, cat_decode):
+    """Resolve a Criteria Type term_uid via code, decode, then canonical decode."""
+    if ct is None:
+        return None, "other"
+    crit_type = _classify_criterion_category(cat_decode)
+    resolved = ct.resolve("Criteria Type", code=cat_code, decode=cat_decode, strict=True)
+    if not resolved:
+        fallback = {
+            "inclusion": "Inclusion Criteria",
+            "exclusion": "Exclusion Criteria",
+            "withdrawal": "Withdrawal Criteria",
+            "run-in": "Run-in Criteria",
+        }.get(crit_type)
+        if fallback:
+            resolved = ct.resolve("Criteria Type", decode=fallback, strict=True)
+    if resolved and not ct.term_is_in_codelist(resolved.get("term_uid"), "Criteria Type"):
+        log.warning("  Criteria type term %s ('%s') is NOT in Criteria Type codelist — discarding",
+                    resolved.get("term_uid"), resolved.get("name"))
+        resolved = None
+    if resolved:
+        log.info("  Criterion category code=%s decode='%s' -> '%s' (%s)",
+                 cat_code, cat_decode, resolved.get("name"), resolved.get("term_uid"))
+    else:
+        log.warning("  Criterion category code=%s decode='%s' (type=%s) NOT RESOLVED in Criteria Type codelist",
+                    cat_code, cat_decode, crit_type)
+    return (resolved["term_uid"] if resolved else None), crit_type
+
+
+def _resolve_endpoint_level_uid(decode):
+    """
+    Resolve endpoint-level term_uid dynamically from the Endpoint Level
+    codelist using strict mode (no fuzzy codelist fallback) and a
+    post-resolve term-in-codelist validation. Catches the "term valid but in
+    wrong codelist" case that triggers OSB 400s.
+    """
+    if ct is None:
+        return None, decode or ""
+    decode_lower = (decode or "").lower()
+    if "primary" in decode_lower:
+        canonical_candidates = ["Primary Outcome Measure", "Primary"]
+        label = "Primary"
+    elif "exploratory" in decode_lower:
+        canonical_candidates = ["Exploratory Outcome Measure", "Exploratory"]
+        label = "Exploratory"
+    else:
+        canonical_candidates = ["Secondary Outcome Measure", "Secondary"]
+        label = "Secondary"
+
+    candidates = ([decode] if decode else []) + canonical_candidates
+    for cand in candidates:
+        resolved = ct.resolve("Endpoint Level", decode=cand, strict=True)
+        if not resolved:
+            continue
+        term_uid = resolved.get("term_uid")
+        if not ct.term_is_in_codelist(term_uid, "Endpoint Level"):
+            log.warning(
+                "    Endpoint level term %s ('%s') is NOT in Endpoint Level codelist — discarding",
+                term_uid, resolved.get("name"))
+            continue
+        log.info("    Endpoint level resolved (strict): decode='%s' -> '%s' (%s)",
+                 cand, resolved.get("name"), term_uid)
+        return term_uid, label
+
+    log.warning(
+        "    Endpoint level NOT RESOLVED for decode='%s' — Endpoint Level "
+        "codelist may be missing in this OSB instance, or none of %s match.",
+        decode, canonical_candidates)
+    return None, label
+
+
+# ── label/description parser (mirrors mappers.parse_visit_label_text) ───────
+_VISIT_NUM_RE = re.compile(
+    r"^\s*(?:visit\s*identifier\s+)?(\d+)\s*$",
+    re.IGNORECASE,
+)
+_TIME_RANGE_RE = re.compile(
+    r"(?:visit\s+)?(day|days|week|weeks|month|months|year|years|hour|hours|min|mins|minute|minutes)"
+    r"\s+(-?\d+)"
+    r"(?:\s+to\s+(?:day|days|week|weeks|month|months|year|years|hour|hours|min|mins|minute|minutes)?\s*(-?\d+))?",
+    re.IGNORECASE,
+)
+_TIME_OF_PHASE_RE = re.compile(
+    r"(day|days|week|weeks|month|months|year|years)\s+(-?\d+)\s+of\s+\w+",
+    re.IGNORECASE,
+)
+_WINDOW_RE = re.compile(
+    r"(?:visit\s*window\s+)?(?:±|\+/-|\+/\-|\+\-)\s*(\d+)"
+    r"(?:\s*(day|days|week|weeks|month|months|hour|hours))?",
+    re.IGNORECASE,
+)
+_NA_RE = re.compile(r"^\s*(?:visit\s*window\s+)?(?:na|n/a)\s*$", re.IGNORECASE)
+
+
+def _normalize_time_unit(u):
+    if not u:
+        return None
+    u = u.lower().rstrip("s")
+    if u in ("min", "minute"):
+        return "minute"
+    return u
+
+
+def parse_visit_label_text(text):
+    """Parse a slash-delimited visit label/description.
+
+    Returns dict with: epoch_name, visit_number, time_value, time_value_end,
+    time_unit, window_lower, window_upper, window_unit, raw_segments.
+    See usdm_to_osb.mappers.parse_visit_label_text for full docs.
+    """
+    out = {
+        "epoch_name": None, "visit_number": None,
+        "time_value": None, "time_value_end": None, "time_unit": None,
+        "window_lower": None, "window_upper": None, "window_unit": None,
+        "raw_segments": [],
+    }
+    if not text:
+        return out
+    segments = [s.strip() for s in text.split("/") if s.strip()]
+    out["raw_segments"] = segments
+    if not segments:
+        return out
+    classified = [False] * len(segments)
+
+    for i, seg in enumerate(segments):
+        m = _VISIT_NUM_RE.match(seg)
+        if m and out["visit_number"] is None:
+            out["visit_number"] = int(m.group(1))
+            classified[i] = True
+            break
+
+    for i, seg in enumerate(segments):
+        if classified[i]:
+            continue
+        m = _TIME_OF_PHASE_RE.search(seg)
+        if m and out["time_value"] is None:
+            out["time_unit"] = _normalize_time_unit(m.group(1))
+            out["time_value"] = int(m.group(2))
+            classified[i] = True
+            continue
+        m = _TIME_RANGE_RE.search(seg)
+        if m and out["time_value"] is None:
+            out["time_unit"] = _normalize_time_unit(m.group(1))
+            out["time_value"] = int(m.group(2))
+            if m.group(3) is not None:
+                out["time_value_end"] = int(m.group(3))
+            classified[i] = True
+            continue
+
+    for i, seg in enumerate(segments):
+        if classified[i]:
+            continue
+        if _NA_RE.match(seg):
+            classified[i] = True
+            continue
+        m = _WINDOW_RE.search(seg)
+        if m:
+            n = int(m.group(1))
+            unit = _normalize_time_unit(m.group(2)) if m.group(2) else "day"
+            out["window_lower"] = -n
+            out["window_upper"] = n
+            out["window_unit"] = unit
+            classified[i] = True
+            continue
+
+    for i, seg in enumerate(segments):
+        if not classified[i] and out["epoch_name"] is None:
+            out["epoch_name"] = seg
+            classified[i] = True
+            break
+
+    return out
+
+
+def _pick_label_text(instance, encounter):
+    """Prefer slash-delimited (more structured) labels; instance over encounter."""
+    sources = []
+    if instance:
+        sources.append(instance)
+    if encounter:
+        sources.append(encounter)
+    best = ""
+    best_segments = 0
+    for src in sources:
+        for key in ("label", "description"):
+            text = (src.get(key) or "").strip()
+            if not text:
+                continue
+            n_segments = text.count("/")
+            if n_segments > best_segments:
+                best, best_segments = text, n_segments
+    if best:
+        return best
+    for src in sources:
+        for key in ("label", "description"):
+            text = (src.get(key) or "").strip()
+            if text:
+                return text
+    return ""
+
+
+def _resolve_onsite_contact_mode_uid(fallback=_DEFAULT_ONSITE_CONTACT_MODE_UID):
+    """
+    Look up the contact-mode term whose submission_value is "ONSITE".
+
+    Tries (in order):
+      1. exact submission_value "ONSITE" within the Visit Contact Mode codelist
+      2. global submission_value search across all codelists (exact + partial)
+      3. hardcoded fallback (CTTerm_000139)
+    """
+    if ct is not None:
+        hit = ct.resolve_by_submission_value("Visit Contact Mode", "ONSITE")
+        if hit and hit.get("term_uid"):
+            log.info("ONSITE contact mode resolved within Visit Contact Mode: %s", hit["term_uid"])
+            return hit["term_uid"]
+        hit = ct.resolve_by_submission_global("ONSITE")
+        if hit and hit.get("term_uid"):
+            log.info("ONSITE contact mode resolved via global submission: %s", hit["term_uid"])
+            return hit["term_uid"]
+    log.info("ONSITE contact mode not found dynamically — using fallback %s", fallback)
+    return fallback
+
+
+def _build_visit_link_index(design):
+    """
+    Single source of truth for the epoch ↔ encounter ↔ timeline ↔ timing ↔
+    instance graph. Walks every scheduleTimeline (main + sub) once.
+
+    Returns a dict — see usdm_to_osb.mappers.build_visit_link_index for keys.
+    """
+    encounters_by_id = {e["id"]: e for e in design.get("encounters", [])}
+    epoch_order = [ep.get("id", "") for ep in design.get("epochs", [])]
+
+    instances_by_id = {}
+    timing_by_from_instance = {}
+    main_instance_to_encounter = {}
+    main_instance_to_epoch = {}
+    encounter_to_main_instance = {}
+    encounter_to_epoch = {}
+    sub_timeline_by_main_instance = {}
+    main_timeline_instance_order = []
+    global_anchor_instance_id = None
 
     for tl in design.get("scheduleTimelines", []):
-        is_main = tl.get("mainTimeline", False)
+        is_main = bool(tl.get("mainTimeline", False))
+
+        for inst in tl.get("instances", []):
+            inst_id = inst.get("id", "")
+            if not inst_id:
+                continue
+            instances_by_id[inst_id] = inst
+            if is_main:
+                main_timeline_instance_order.append(inst_id)
+                enc_id = inst.get("encounterId", "") or ""
+                epoch_id = inst.get("epochId", "") or ""
+                if enc_id:
+                    encounter_to_main_instance.setdefault(enc_id, inst_id)
+                    encounter_to_epoch.setdefault(enc_id, epoch_id)
+                    main_instance_to_encounter[inst_id] = enc_id
+                    main_instance_to_epoch[inst_id] = epoch_id
+                sub_tl_id = inst.get("timelineId") or None
+                if sub_tl_id:
+                    sub_timeline_by_main_instance[inst_id] = sub_tl_id
+
         for timing in tl.get("timings", []):
             from_id = timing.get("relativeFromScheduledInstanceId", "")
             if from_id:
-                instance_to_timing[from_id] = timing
-        if is_main:
-            for inst in tl.get("instances", []):
-                enc_id = inst.get("encounterId", "")
-                epoch_id = inst.get("epochId", "")
-                inst_id = inst.get("id", "")
-                if enc_id:
-                    enc_to_epoch[enc_id] = epoch_id
-                    enc_to_instance[enc_id] = inst_id
+                timing_by_from_instance[from_id] = timing
+            if is_main and global_anchor_instance_id is None:
+                ttype = timing.get("type", {}).get("decode", "")
+                if ttype.lower() == "fixed reference":
+                    global_anchor_instance_id = timing.get("relativeFromScheduledInstanceId") or None
 
-    return enc_to_epoch, enc_to_instance, instance_to_timing
+    global_anchor_encounter_id = (
+        main_instance_to_encounter.get(global_anchor_instance_id)
+        if global_anchor_instance_id else None
+    )
+    if global_anchor_instance_id:
+        log.info("Global anchor: instance=%s encounter=%s (Fixed Reference)",
+                 global_anchor_instance_id, global_anchor_encounter_id)
 
+    # Parse slash-delimited labels/descriptions on each encounter (and its
+    # linking instance) so we can fall back to label-derived linkage when
+    # the structural fields are missing.
+    parsed_label_by_encounter = {}
+    for enc_id, enc in encounters_by_id.items():
+        link_inst = instances_by_id.get(encounter_to_main_instance.get(enc_id, ""))
+        parsed_label_by_encounter[enc_id] = parse_visit_label_text(
+            _pick_label_text(link_inst, enc)
+        )
 
-def _determine_global_anchor(design):
-    for tl in design.get("scheduleTimelines", []):
-        if not tl.get("mainTimeline", False):
+    epochs_by_id = {ep["id"]: ep for ep in design.get("epochs", [])}
+    epoch_name_to_id = {}
+    for ep_id, ep in epochs_by_id.items():
+        for key in ("label", "name"):
+            n = (ep.get(key) or "").strip().lower()
+            if n:
+                epoch_name_to_id.setdefault(n, ep_id)
+
+    for enc_id, parsed in parsed_label_by_encounter.items():
+        if enc_id in encounter_to_epoch and encounter_to_epoch[enc_id]:
             continue
-        for timing in tl.get("timings", []):
-            if timing.get("type", {}).get("decode", "").lower() == "fixed reference":
-                inst_id = timing.get("relativeFromScheduledInstanceId", "")
-                for inst in tl.get("instances", []):
-                    if inst.get("id") == inst_id:
-                        anchor = inst.get("encounterId", "")
-                        log.info("Global anchor: instance=%s encounter=%s (Fixed Reference)", inst_id, anchor)
-                        return anchor
-    return None
+        ep_name = parsed.get("epoch_name")
+        if not ep_name:
+            continue
+        ep_id = epoch_name_to_id.get(ep_name.strip().lower())
+        if not ep_id:
+            for known_name, known_id in epoch_name_to_id.items():
+                if known_name in ep_name.lower() or ep_name.lower() in known_name:
+                    ep_id = known_id
+                    break
+        if ep_id:
+            encounter_to_epoch[enc_id] = ep_id
+            log.info("Encounter '%s' linked to epoch '%s' via parsed label epoch_name='%s'",
+                     enc_id, ep_id, ep_name)
+
+    epoch_encounters = {eid: [] for eid in epoch_order}
+    seen_encs = set()
+    for inst_id in main_timeline_instance_order:
+        enc_id = main_instance_to_encounter.get(inst_id)
+        if not enc_id or enc_id in seen_encs:
+            continue
+        epoch_id = main_instance_to_epoch.get(inst_id) or encounter_to_epoch.get(enc_id)
+        if epoch_id and epoch_id in epoch_encounters:
+            epoch_encounters[epoch_id].append(enc_id)
+            seen_encs.add(enc_id)
+    for enc_id, epoch_id in encounter_to_epoch.items():
+        if enc_id in seen_encs or not epoch_id:
+            continue
+        if epoch_id in epoch_encounters:
+            epoch_encounters[epoch_id].append(enc_id)
+            seen_encs.add(enc_id)
+
+    for enc_id in encounters_by_id:
+        if enc_id not in encounter_to_main_instance and enc_id not in encounter_to_epoch:
+            log.warning("Encounter '%s' not linked via main-timeline instance OR parsed label", enc_id)
+
+    return {
+        "encounters_by_id": encounters_by_id,
+        "epoch_order": epoch_order,
+        "instances_by_id": instances_by_id,
+        "timing_by_from_instance": timing_by_from_instance,
+        "main_instance_to_encounter": main_instance_to_encounter,
+        "main_instance_to_epoch": main_instance_to_epoch,
+        "encounter_to_main_instance": encounter_to_main_instance,
+        "encounter_to_epoch": encounter_to_epoch,
+        "epoch_encounters": epoch_encounters,
+        "global_anchor_instance_id": global_anchor_instance_id,
+        "global_anchor_encounter_id": global_anchor_encounter_id,
+        "sub_timeline_by_main_instance": sub_timeline_by_main_instance,
+        "parsed_label_by_encounter": parsed_label_by_encounter,
+    }
 
 
 def upload_visits(study_uid, design, epoch_map):
-    encounters_by_id = {e["id"]: e for e in design.get("encounters", [])}
+    idx = _build_visit_link_index(design)
+    encounters_by_id = idx["encounters_by_id"]
     if not encounters_by_id:
         log.info("No encounters/visits to upload.")
         return []
 
-    enc_to_epoch, enc_to_instance, instance_to_timing = _build_instance_maps(design)
-    global_anchor_enc_id = _determine_global_anchor(design)
+    timing_by_from_instance = idx["timing_by_from_instance"]
+    encounter_to_main_instance = idx["encounter_to_main_instance"]
+    epoch_order = idx["epoch_order"]
+    epoch_encounters = idx["epoch_encounters"]
+    global_anchor_enc_id = idx["global_anchor_encounter_id"]
+    parsed_label_by_encounter = idx["parsed_label_by_encounter"]
 
     global_anchor_ref = ct.resolve("Time Reference", decode="Global Anchor Visit Reference")
+    if not global_anchor_ref:
+        global_anchor_ref = ct.resolve_by_submission_global("GLOBAL ANCHOR VISIT REFERENCE")
     global_anchor_ref_uid = global_anchor_ref["term_uid"] if global_anchor_ref else None
     log.info("Global anchor time_reference_uid: %s", global_anchor_ref_uid)
 
-    epoch_order = [ep.get("id", "") for ep in design.get("epochs", [])]
-    epoch_encounters = {eid: [] for eid in epoch_order}
-    for enc_id, epoch_id in enc_to_epoch.items():
-        if epoch_id in epoch_encounters:
-            epoch_encounters[epoch_id].append(enc_id)
+    onsite_fallback_uid = _resolve_onsite_contact_mode_uid()
 
     log.info("Uploading visits (%d encounters across %d epochs)...",
              len(encounters_by_id), len(epoch_order))
@@ -1066,19 +1615,26 @@ def upload_visits(study_uid, design, epoch_map):
         epoch_name = next((e["name"] for e in design.get("epochs", []) if e["id"] == epoch_id), epoch_id)
         log.info("--- Epoch '%s': %d visits ---", epoch_name, len(enc_ids))
 
+        epoch_obj = next((e for e in design.get("epochs", []) if e["id"] == epoch_id), {})
+        epoch_name = epoch_obj.get("label") or epoch_obj.get("name") or ""
+
         for enc_id in enc_ids:
             enc = encounters_by_id.get(enc_id)
             if not enc:
                 continue
             label = enc.get("label", enc.get("name", ""))
 
+            # Visit type: encounter type code/decode -> label -> epoch name fallback
             type_code, type_decode = _code_obj(enc.get("type"))
             visit_type = ct.resolve("Visit Type", code=type_code, decode=type_decode)
             if not visit_type:
                 visit_type = ct.resolve("Visit Type", decode=label)
-            log.info("  Visit '%s': type code=%s decode='%s' -> %s", label, type_code, type_decode, visit_type)
+            if not visit_type and epoch_name:
+                visit_type = _resolve_visit_type_for_epoch(epoch_name)
+            log.info("  Visit '%s' (epoch='%s'): type code=%s decode='%s' -> %s",
+                     label, epoch_name, type_code, type_decode, visit_type)
 
-            # Contact mode: STRICTLY from codelist (matches notebook cell 14)
+            # Contact mode: prefer per-encounter codelist match, fall back to ONSITE.
             contact_mode_uid = None
             contact_modes = enc.get("contactModes", [])
             if contact_modes:
@@ -1086,11 +1642,15 @@ def upload_visits(study_uid, design, epoch_map):
                 cm = ct.resolve("Visit Contact Mode", code=cm_code, decode=cm_decode)
                 contact_mode_uid = cm["term_uid"] if cm else None
                 log.info("  Visit '%s': contactMode code=%s decode='%s' -> %s", label, cm_code, cm_decode, cm)
-                if not contact_mode_uid:
-                    log.warning("  Visit '%s': contact mode NOT FOUND in 'Visit Contact Mode' codelist for code='%s' decode='%s'", label, cm_code, cm_decode)
+            if not contact_mode_uid:
+                contact_mode_uid = onsite_fallback_uid
+                log.info("  Visit '%s': contactMode fallback -> %s", label, contact_mode_uid)
 
-            inst_id = enc_to_instance.get(enc_id, "")
-            timing = instance_to_timing.get(inst_id)
+            inst_id = encounter_to_main_instance.get(enc_id, "")
+            timing = timing_by_from_instance.get(inst_id) if inst_id else None
+            parsed = parsed_label_by_encounter.get(enc_id, {})
+            time_from_record = False
+            window_from_record = False
             time_value = 0
             time_unit = "day"
             min_window = None
@@ -1107,6 +1667,7 @@ def upload_visits(study_uid, design, epoch_map):
                     else:
                         time_value = int(parsed_val)
                     time_unit = parsed_unit
+                    time_from_record = True
 
                 wl = timing.get("windowLower", "")
                 wu = timing.get("windowUpper", "")
@@ -1115,14 +1676,29 @@ def upload_visits(study_uid, design, epoch_map):
                     if wl_val is not None:
                         min_window = -abs(int(wl_val))
                         window_unit = wl_unit
+                        window_from_record = True
                 if wu:
                     wu_val, wu_unit = _parse_iso8601_duration(wu)
                     if wu_val is not None:
                         max_window = int(wu_val)
                         window_unit = window_unit or wu_unit
+                        window_from_record = True
 
                 log.info("  Visit '%s': timing=%s -> %d %s, window=[%s, %s]",
                          label, raw_value, time_value, time_unit, min_window, max_window)
+
+            # ── Fallback to parsed label/description when timing is missing ──
+            if not time_from_record and parsed.get("time_value") is not None:
+                time_value = int(parsed["time_value"])
+                time_unit = parsed.get("time_unit") or time_unit
+                log.info("  Visit '%s': time recovered from label -> %d %s",
+                         label, time_value, time_unit)
+            if not window_from_record and parsed.get("window_lower") is not None:
+                min_window = parsed["window_lower"]
+                max_window = parsed["window_upper"]
+                window_unit = parsed.get("window_unit") or window_unit
+                log.info("  Visit '%s': window recovered from label -> [%s, %s] %s",
+                         label, min_window, max_window, window_unit)
 
             unit_def = ct.resolve_unit(time_unit)
             time_unit_uid = unit_def["uid"] if unit_def else None
@@ -1154,7 +1730,7 @@ def upload_visits(study_uid, design, epoch_map):
                 "description": enc.get("description", ""),
                 "start_rule": "",
                 "end_rule": "",
-                "visit_contact_mode_uid": "CTTerm_000139",
+                "visit_contact_mode_uid": contact_mode_uid,
                 "epoch_allocation_uid": None,
                 "visit_class": "SINGLE_VISIT",
                 "visit_subclass": "SINGLE_VISIT",
@@ -1202,7 +1778,11 @@ def upload_objectives_and_endpoints(study_uid, design):
 
         level_decode = obj.get("level", {}).get("decode", "")
         level_code = obj.get("level", {}).get("code", "")
-        resolved_level = ct.resolve("Objective Level", code=level_code, decode=level_decode)
+        resolved_level = ct.resolve("Objective Level", code=level_code, decode=level_decode, strict=True)
+        if resolved_level and not ct.term_is_in_codelist(resolved_level.get("term_uid"), "Objective Level"):
+            log.warning("  Objective level term %s ('%s') is NOT in Objective Level codelist — discarding",
+                        resolved_level.get("term_uid"), resolved_level.get("name"))
+            resolved_level = None
         level_uid = resolved_level["term_uid"] if resolved_level else None
         level_name = resolved_level["name"] if resolved_level else level_decode
         log.info("  [Obj %d] '%s...' level='%s' -> uid=%s (%s)",
@@ -1274,17 +1854,8 @@ def upload_objectives_and_endpoints(study_uid, design):
             if not ep_text.strip():
                 continue
 
-            ep_level_decode = ep.get("level", {}).get("decode", "").lower()
-            if "primary" in ep_level_decode:
-                ep_level_uid = "C98772"
-                ep_level_label = "Primary"
-            elif "exploratory" in ep_level_decode:
-                ep_level_uid = "C98724"
-                ep_level_label = "Exploratory"
-            else:
-                ep_level_uid = "C98781"
-                ep_level_label = "Secondary"
-
+            ep_level_decode = ep.get("level", {}).get("decode", "")
+            ep_level_uid, ep_level_label = _resolve_endpoint_level_uid(ep_level_decode)
             log.info("      [Ep %d] '%s...' level='%s' -> %s (%s)",
                      ep_idx+1, ep_text[:50], ep_level_decode, ep_level_uid, ep_level_label)
 
@@ -1369,12 +1940,9 @@ def upload_criteria(study_uid, version, design):
     results = []
 
     for crit in elig_criteria:
-        cat = crit.get("category", {}).get("decode", "").lower()
+        cat_decode = crit.get("category", {}).get("decode", "")
         cat_code = crit.get("category", {}).get("code", "")
-        is_inclusion = cat.startswith("in")
-        search = "Inclusion" if is_inclusion else "Exclusion"
-        resolved = ct.resolve("Criteria Type", code=cat_code, decode=search)
-        type_uid = resolved["term_uid"] if resolved else None
+        type_uid, crit_type = _resolve_criteria_type_uid(cat_code, cat_decode)
 
         item_id = crit.get("criterionItemId", crit.get("id", ""))
         raw_text = text_map.get(item_id, crit.get("text", ""))
@@ -1413,7 +1981,7 @@ def upload_criteria(study_uid, version, design):
             log.error("  FAILED: study criteria for '%s...' (%d): %s", safe[:40], r2.status_code, r2.text[:200])
             results.append({"id": item_id, "error": r2.text[:200]})
         else:
-            log.info("  SUCCESS: criteria '%s...' (%s)", safe[:40], "inclusion" if is_inclusion else "exclusion")
+            log.info("  SUCCESS: criteria '%s...' (%s)", safe[:40], crit_type)
             results.append({"id": item_id, "status": "success"})
 
     ok = sum(1 for r in results if r.get("status") == "success")
