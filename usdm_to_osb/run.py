@@ -79,10 +79,15 @@ PROJECT_NUMBER_OVERRIDE = None  # e.g. "999"
 # ==============================================================================
 
 class TokenManager:
-    """OAuth2 password-grant token manager with auto-refresh."""
+    """OAuth2 password-grant token manager with auto-refresh.
 
-    def __init__(self, idp_url, client_id, client_secret, username, password):
-        self.token_url = f"{idp_url.rstrip('/')}/o/token/"
+    When ``no_auth=True``, all token logic is skipped and ``get_headers()``
+    returns only ``Content-Type`` — for OSB instances exposed without auth.
+    """
+
+    def __init__(self, idp_url, client_id, client_secret, username, password, no_auth=False):
+        self.no_auth = no_auth
+        self.token_url = f"{idp_url.rstrip('/')}/o/token/" if idp_url else ""
         self.client_id = client_id
         self.client_secret = client_secret
         self.username = username
@@ -125,6 +130,8 @@ class TokenManager:
         }, "refresh")
 
     def get_token(self):
+        if self.no_auth:
+            return None
         if self._access_token and time.time() < self._expires_at:
             return self._access_token
         if self._refresh_token and self._refresh():
@@ -134,6 +141,8 @@ class TokenManager:
         raise RuntimeError("Unable to obtain access token")
 
     def get_headers(self):
+        if self.no_auth:
+            return {"Content-Type": "application/json"}
         return {"Authorization": f"Bearer {self.get_token()}", "Content-Type": "application/json"}
 
 
@@ -2512,7 +2521,7 @@ def _load_config_file(path):
         return json.load(fh)
 
 
-def _resolve_credentials(cfg_path=None):
+def _resolve_credentials(cfg_path=None, no_auth=False):
     """Return (idp_url, api_url, client_id, client_secret, username, password).
 
     Resolution order for each value:
@@ -2521,14 +2530,23 @@ def _resolve_credentials(cfg_path=None):
          OSB_CLIENT_SECRET, OSB_USERNAME, OSB_PASSWORD)
       3. Module-level defaults (non-secret fields only)
       4. Interactive prompt (secret fields that are still blank)
+
+    When ``no_auth=True``, only ``api_url`` is required; all credential
+    resolution and interactive prompts are skipped. The config file (if
+    supplied) still provides ``api_base_url`` and ``project_number``.
     """
     cfg = {}
     if cfg_path:
         cfg = _load_config_file(cfg_path)
         log.info("Loaded config from: %s", cfg_path)
 
+    api_url = cfg.get("api_base_url") or os.environ.get("OSB_API_URL") or API_BASE_URL
+
+    if no_auth:
+        log.info("Running in --no-auth mode: skipping OAuth2 credential resolution.")
+        return "", api_url, "", "", "", ""
+
     idp_url     = cfg.get("idp_url")     or os.environ.get("OSB_IDP_URL")     or IDP_URL
-    api_url     = cfg.get("api_base_url") or os.environ.get("OSB_API_URL")     or API_BASE_URL
     client_id   = cfg.get("client_id")   or os.environ.get("OSB_CLIENT_ID")   or OAUTH_CLIENT_ID
     secret      = cfg.get("client_secret") or os.environ.get("OSB_CLIENT_SECRET") or OAUTH_CLIENT_SECRET
     username    = cfg.get("username")    or os.environ.get("OSB_USERNAME")    or OAUTH_USERNAME
@@ -2545,18 +2563,21 @@ def _resolve_credentials(cfg_path=None):
     return idp_url, api_url, client_id, secret, username, password
 
 
-def main(usdm_path=None, cfg_path=None):
+def main(usdm_path=None, cfg_path=None, no_auth=False):
     """Main entry point - mirrors the notebook execution flow."""
     global token_mgr, ct, USDM_FILE_PATH, API_BASE_URL
 
     if usdm_path:
         USDM_FILE_PATH = usdm_path
 
-    idp_url, api_url, client_id, secret, username, password = _resolve_credentials(cfg_path)
+    if no_auth is False:
+        no_auth = os.environ.get("OSB_NO_AUTH", "").lower() in ("1", "true", "yes")
+
+    idp_url, api_url, client_id, secret, username, password = _resolve_credentials(cfg_path, no_auth=no_auth)
     API_BASE_URL = api_url
 
     # Initialize token manager
-    token_mgr = TokenManager(idp_url, client_id, secret, username, password)
+    token_mgr = TokenManager(idp_url, client_id, secret, username, password, no_auth=no_auth)
 
     # Phase 1: Validation
     log.info("Loading USDM file: %s", USDM_FILE_PATH)
@@ -2602,6 +2623,9 @@ if __name__ == "__main__":
     parser.add_argument("--client-secret", type=str, default=None, help="OAuth2 client secret")
     parser.add_argument("--username", type=str, default=None, help="OSB username (email)")
     parser.add_argument("--password", type=str, default=None, help="OSB password")
+    parser.add_argument("--no-auth", action="store_true",
+                        help="Connect to an OSB instance that has no authentication "
+                             "(skips OAuth2; only --api-url / config api_base_url is needed)")
     args = parser.parse_args()
 
     # CLI args override env vars — push them into env so _resolve_credentials picks them up
@@ -2618,4 +2642,4 @@ if __name__ == "__main__":
     if args.password:
         os.environ["OSB_PASSWORD"] = args.password
 
-    main(usdm_path=args.usdm, cfg_path=args.config)
+    main(usdm_path=args.usdm, cfg_path=args.config, no_auth=args.no_auth)

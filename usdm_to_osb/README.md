@@ -79,6 +79,23 @@ Then edit `config.json`:
 3. CLI flags: `--client-secret`, `--username`, `--password`, etc.
 4. Interactive prompt at runtime (for any secrets still missing)
 
+### Running against an OSB instance without authentication
+
+If your OSB instance is exposed without OAuth2 (e.g. a local dev container with auth disabled), pass `--no-auth`:
+
+```bash
+python -m usdm_to_osb \
+    --usdm    "C:\full\path\to\study.json" \
+    --api-url "http://localhost:5003" \
+    --no-auth
+```
+
+In this mode:
+- No `idp_url`, `client_id`, `client_secret`, `username`, or `password` is required.
+- Requests are sent without an `Authorization` header.
+- A `--config` file is still accepted and may supply `api_base_url`; all credential fields in it are ignored.
+- The `OSB_NO_AUTH=1` environment variable has the same effect.
+
 ---
 
 ## Quick Start
@@ -130,6 +147,7 @@ Credential options (use --config for simplest setup):
   --client-secret STR  OAuth2 client secret
   --username EMAIL     OSB login email
   --password STR       OSB password
+  --no-auth            Connect to an OSB instance without auth (skips OAuth2)
 ```
 
 ### Examples

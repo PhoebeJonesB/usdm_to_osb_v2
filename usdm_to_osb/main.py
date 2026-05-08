@@ -79,10 +79,30 @@ def get_next_study_number(api: APIClient) -> str:
 
 
 def _build_config(args) -> Config:
-    """Build Config from --config file or CLI args."""
+    """Build Config from --config file or CLI args.
+
+    With ``--no-auth``, only ``api_base_url`` is required; OAuth2 fields are
+    skipped. The config file (if supplied) still provides ``api_base_url``
+    and ``project_number``.
+    """
+    no_auth = bool(getattr(args, "no_auth", False))
+    cfg = {}
     if args.config:
         with open(args.config, encoding="utf-8") as f:
             cfg = json.load(f)
+
+    if no_auth:
+        api_base_url = cfg.get("api_base_url") or args.api_url
+        if not api_base_url:
+            print("ERROR: --api-url (or api_base_url in --config) is required with --no-auth")
+            sys.exit(1)
+        return Config(
+            api_base_url=api_base_url,
+            project_number=cfg.get("project_number", "999"),
+            no_auth=True,
+        )
+
+    if args.config:
         return Config(
             api_base_url=cfg.get("api_base_url", args.api_url),
             idp_url=cfg.get("idp_url", args.idp_url),
@@ -90,9 +110,10 @@ def _build_config(args) -> Config:
             client_secret=cfg.get("client_secret", ""),
             username=cfg.get("username", ""),
             password=cfg.get("password", ""),
+            project_number=cfg.get("project_number", "999"),
         )
     if not args.client_secret or not args.username or not args.password:
-        print("ERROR: --client-secret, --username, and --password are required (or use --config)")
+        print("ERROR: --client-secret, --username, and --password are required (or use --config, or --no-auth)")
         sys.exit(1)
     return Config(
         api_base_url=args.api_url,
@@ -300,6 +321,10 @@ Workflow:
     p_up.add_argument("--password", help="OSB password")
     p_up.add_argument("--config", help="Path to JSON config file (overrides CLI args)")
     p_up.add_argument(
+        "--no-auth", action="store_true",
+        help="OSB instance has no authentication (skip OAuth2; only --api-url / config api_base_url required)",
+    )
+    p_up.add_argument(
         "--skip", nargs="*", default=[],
         choices=["metadata", "arms", "epochs", "elements", "cells", "visits", "objectives", "criteria", "activities"],
         help="Sections to skip during upload",
@@ -314,6 +339,10 @@ Workflow:
     p_cl.add_argument("--username", help="OSB username")
     p_cl.add_argument("--password", help="OSB password")
     p_cl.add_argument("--config", help="Path to JSON config file")
+    p_cl.add_argument(
+        "--no-auth", action="store_true",
+        help="OSB instance has no authentication (skip OAuth2; only --api-url / config api_base_url required)",
+    )
     p_cl.add_argument("--log-dir", default=".", help="Directory for log files")
 
     args = parser.parse_args()
