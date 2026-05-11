@@ -13,9 +13,6 @@ parser.add_argument("--client-id", type=str, default=None, help="OAuth2 client I
 parser.add_argument("--client-secret", type=str, default=None, help="OAuth2 client secret")
 parser.add_argument("--username", type=str, default=None, help="OSB username (email)")
 parser.add_argument("--password", type=str, default=None, help="OSB password")
-parser.add_argument("--no-auth", action="store_true",
-                    help="Connect to an OSB instance that has no authentication "
-                         "(skips OAuth2; only --api-url / config api_base_url is needed)")
 args = parser.parse_args()
 
 if args.api_url:
@@ -31,4 +28,4 @@ if args.username:
 if args.password:
     os.environ["OSB_PASSWORD"] = args.password
 
-main(usdm_path=args.usdm, cfg_path=args.config, no_auth=args.no_auth)
+main(usdm_path=args.usdm, cfg_path=args.config)

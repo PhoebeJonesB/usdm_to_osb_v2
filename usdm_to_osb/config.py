@@ -13,30 +13,27 @@ class Config:
     def __init__(
         self,
         api_base_url: str,
-        idp_url: str = "",
-        client_id: str = "",
-        client_secret: str = "",
-        username: str = "",
-        password: str = "",
+        idp_url: str,
+        client_id: str,
+        client_secret: str,
+        username: str,
+        password: str,
         project_number: str = "999",
-        no_auth: bool = False,
     ):
         self.api_base_url = api_base_url.rstrip("/")
-        self.idp_url = idp_url.rstrip("/") if idp_url else ""
+        self.idp_url = idp_url.rstrip("/")
         self.client_id = client_id
         self.client_secret = client_secret
         self.username = username
         self.password = password
         self.project_number = project_number
-        self.no_auth = no_auth
 
 
 class TokenManager:
     """Manages OAuth2 tokens using the password grant flow with auto-refresh."""
 
     def __init__(self, config: Config):
-        self.no_auth = config.no_auth
-        self.token_url = f"{config.idp_url}/o/token/" if config.idp_url else ""
+        self.token_url = f"{config.idp_url}/o/token/"
         self.client_id = config.client_id
         self.client_secret = config.client_secret
         self.username = config.username
@@ -90,8 +87,6 @@ class TokenManager:
         )
 
     def get_token(self) -> str:
-        if self.no_auth:
-            return ""
         if self._access_token and time.time() < self._expires_at:
             return self._access_token
         if self._refresh_token and self._refresh():
@@ -101,8 +96,6 @@ class TokenManager:
         raise RuntimeError("Unable to obtain access token")
 
     def get_headers(self) -> dict:
-        if self.no_auth:
-            return {"Content-Type": "application/json"}
         return {
             "Authorization": f"Bearer {self.get_token()}",
             "Content-Type": "application/json",

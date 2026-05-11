@@ -304,29 +304,104 @@ def map_study_description(version: dict) -> dict:
     }
 
 
+# ── metadata-patch term resolution (strict + cross-codelist validation) ────
+
+# OSB metadata-patch fields → the EXACT codelist name to resolve against.
+# Using the precise "…Response" name (instead of the short alias) plus
+# strict=True ensures the resolver never falls through to a similarly-named
+# but DIFFERENT codelist ("SEND Study Type", "Endpoint Sub Level", "Trial
+# Type", …) which would produce an OSB 400: "term not found in codelist".
+METADATA_FIELD_CODELIST = {
+    "study_type_code":             "Study Type Response",
+    "trial_phase_code":            "Trial Phase Response",
+    "trial_types_codes":           "Trial Type Response",
+    "intervention_model_code":     "Intervention Model Response",
+    "trial_blinding_schema_code":  "Trial Blinding Schema Response",
+    "trial_intent_types_codes":    "Trial Intent Type Response",
+    "intervention_type_code":      "Intervention Type Response",
+    "control_type_code":           "Control Type Response",
+    "sex_of_participants_code":    "Sex of Participants Response",
+}
+
+
+def _resolve_metadata_term(
+    ct: CTResolver,
+    response_codelist: str,
+    code: str,
+    decode: str,
+) -> dict | None:
+    """
+    Resolve a single metadata-patch term strictly within ``response_codelist``.
+
+    Pipeline:
+      1. ``ct.resolve(response_codelist, code, decode, strict=True)`` — no
+         fuzzy codelist fallback (prevents "study type" → "SEND Study Type"
+         and similar cross-codelist leaks).
+      2. ``ct.term_is_in_codelist(term_uid, response_codelist)`` — verify
+         the returned term actually belongs to the exact codelist (defends
+         against bidirectional alias leaks).
+      3. Returns ``None`` rather than a wrong term so OSB receives ``null``
+         and doesn't 400 on a "term not found in codelist" validation error.
+    """
+    if not code and not decode:
+        return None
+    resolved = ct.resolve(response_codelist, code=code, decode=decode, strict=True)
+    if not resolved:
+        logger.warning("  metadata: '%s' did not match in '%s' (code=%s decode='%s')",
+                       decode or code, response_codelist, code, decode)
+        return None
+    term_uid = resolved.get("term_uid")
+    if not ct.term_is_in_codelist(term_uid, response_codelist):
+        logger.warning(
+            "  metadata: term %s ('%s') is NOT in '%s' codelist — discarding "
+            "to prevent OSB 400 (term not found in codelist)",
+            term_uid, resolved.get("name"), response_codelist,
+        )
+        return None
+    logger.info("  metadata: '%s' resolved in '%s' -> %s (%s)",
+                decode or code, response_codelist, resolved.get("name"), term_uid)
+    return resolved
+
+
+def _resolve_metadata_multiple(
+    ct: CTResolver,
+    response_codelist: str,
+    items: list[dict],
+) -> list[dict]:
+    """List-form of _resolve_metadata_term, drops any cross-codelist leaks."""
+    out = []
+    for item in items or []:
+        resolved = _resolve_metadata_term(
+            ct, response_codelist,
+            item.get("code", ""), item.get("decode", ""),
+        )
+        if resolved:
+            out.append(resolved)
+    return out
+
+
 # ── high-level study design ─────────────────────────────────────────────────
 
 def map_high_level_design(design: dict, ct: CTResolver) -> dict:
-    """Build high_level_study_design from the first studyDesign."""
+    """Build high_level_study_design from the first studyDesign.
+
+    Every codelist lookup is strict + cross-codelist-validated via
+    ``_resolve_metadata_term`` — see METADATA_FIELD_CODELIST above.
+    """
     result: dict[str, Any] = {}
 
-    # study_type_code: studyType is a Code {code, decode}
     code, decode = _code_obj(design.get("studyType"))
-    resolved = ct.resolve("Study Type", code=code, decode=decode)
-    result["study_type_code"] = _term_or_none(resolved)
-    logger.info("  study_type_code: code=%s decode='%s' -> %s", code, decode, resolved)
+    result["study_type_code"] = _resolve_metadata_term(
+        ct, METADATA_FIELD_CODELIST["study_type_code"], code, decode)
 
-    # trial_phase_code: studyPhase is an AliasCode -> standardCode
     code, decode = _alias_code(design.get("studyPhase"))
-    resolved = ct.resolve("Trial Phase", code=code, decode=decode)
-    result["trial_phase_code"] = _term_or_none(resolved)
-    logger.info("  trial_phase_code: code=%s decode='%s' -> %s", code, decode, resolved)
+    result["trial_phase_code"] = _resolve_metadata_term(
+        ct, METADATA_FIELD_CODELIST["trial_phase_code"], code, decode)
 
-    # trial_types_codes: subTypes is a list of Code objects
     sub_types = design.get("subTypes", [])
-    resolved_list = ct.resolve_multiple("Trial Type", sub_types) if sub_types else []
+    resolved_list = _resolve_metadata_multiple(
+        ct, METADATA_FIELD_CODELIST["trial_types_codes"], sub_types)
     result["trial_types_codes"] = resolved_list or None
-    logger.info("  trial_types_codes: %d resolved from %d subTypes", len(resolved_list), len(sub_types))
 
     return result
 
@@ -352,11 +427,12 @@ def map_study_population(design: dict, ct: CTResolver) -> dict:
             code, decode = standard.get("code", ""), standard.get("decode", "")
             result["disease_conditions_or_indications_codes"] = [{"term_uid": code, "name": decode}]
 
-    # sex_of_participants_code
+    # sex_of_participants_code — strict against Sex of Participants Response
     planned_sex = population.get("plannedSex", [])
     if planned_sex and planned_sex[0]:
         code, decode = _code_obj(planned_sex[0])
-        result["sex_of_participants_code"] = _term_or_none(ct.resolve("Sex", code=code, decode=decode))
+        result["sex_of_participants_code"] = _resolve_metadata_term(
+            ct, METADATA_FIELD_CODELIST["sex_of_participants_code"], code, decode)
 
     # number_of_expected_subjects
     enrollment = population.get("plannedEnrollmentNumber", population.get("plannedEnrollmentNumberQuantity", {}))
@@ -411,28 +487,25 @@ def map_study_intervention(design: dict, ct: CTResolver, version: dict | None = 
     """
     result: dict[str, Any] = {}
 
-    # intervention_model_code
+    # All resolves below go through _resolve_metadata_term so the lookup is
+    # strict (no fuzzy codelist fallback) AND validates the returned term
+    # actually belongs to the exact "...Response" codelist.
+
     code, decode = _code_obj(design.get("model"))
-    result["intervention_model_code"] = _term_or_none(ct.resolve("Intervention Model", code=code, decode=decode))
-    logger.info("  intervention_model_code: code=%s decode='%s' -> %s",
-                code, decode, result["intervention_model_code"])
+    result["intervention_model_code"] = _resolve_metadata_term(
+        ct, METADATA_FIELD_CODELIST["intervention_model_code"], code, decode)
 
-    # trial_blinding_schema_code
     code, decode = _alias_code(design.get("blindingSchema"))
-    result["trial_blinding_schema_code"] = _term_or_none(
-        ct.resolve("Trial Blinding Schema", code=code, decode=decode)
-    )
-    logger.info("  trial_blinding_schema_code: code=%s decode='%s' -> %s",
-                code, decode, result["trial_blinding_schema_code"])
+    result["trial_blinding_schema_code"] = _resolve_metadata_term(
+        ct, METADATA_FIELD_CODELIST["trial_blinding_schema_code"], code, decode)
 
-    # trial_intent_types_codes
     intent_types = design.get("intentTypes", [])
-    result["trial_intent_types_codes"] = ct.resolve_multiple("Trial Intent Type", intent_types) or None
-    logger.info("  trial_intent_types_codes: %d resolved from %d intentTypes",
-                len(result.get("trial_intent_types_codes") or []), len(intent_types))
+    intent_list = _resolve_metadata_multiple(
+        ct, METADATA_FIELD_CODELIST["trial_intent_types_codes"], intent_types)
+    result["trial_intent_types_codes"] = intent_list or None
 
-    # intervention_type_code: prefer design.interventionType (Code or AliasCode),
-    # else first studyInterventions[*].type from the version.
+    # intervention_type_code: prefer design.interventionType, else first
+    # version.studyInterventions[*].type.
     int_type_obj = design.get("interventionType")
     if int_type_obj:
         if isinstance(int_type_obj, dict) and "standardCode" in int_type_obj:
@@ -446,11 +519,8 @@ def map_study_intervention(design: dict, ct: CTResolver, version: dict | None = 
                 code, decode = _code_obj(si.get("type"))
                 if code or decode:
                     break
-    result["intervention_type_code"] = _term_or_none(
-        ct.resolve("Intervention Type", code=code, decode=decode)
-    )
-    logger.info("  intervention_type_code: code=%s decode='%s' -> %s",
-                code, decode, result["intervention_type_code"])
+    result["intervention_type_code"] = _resolve_metadata_term(
+        ct, METADATA_FIELD_CODELIST["intervention_type_code"], code, decode)
 
     # control_type_code: studyDesign.controlType (synthesizer-provided)
     ct_type_obj = design.get("controlType")
@@ -459,11 +529,8 @@ def map_study_intervention(design: dict, ct: CTResolver, version: dict | None = 
             code, decode = _alias_code(ct_type_obj)
         else:
             code, decode = _code_obj(ct_type_obj)
-        result["control_type_code"] = _term_or_none(
-            ct.resolve("Control Type", code=code, decode=decode)
-        )
-        logger.info("  control_type_code: code=%s decode='%s' -> %s",
-                    code, decode, result["control_type_code"])
+        result["control_type_code"] = _resolve_metadata_term(
+            ct, METADATA_FIELD_CODELIST["control_type_code"], code, decode)
 
     return result
 

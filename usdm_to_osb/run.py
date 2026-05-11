@@ -79,15 +79,10 @@ PROJECT_NUMBER_OVERRIDE = None  # e.g. "999"
 # ==============================================================================
 
 class TokenManager:
-    """OAuth2 password-grant token manager with auto-refresh.
+    """OAuth2 password-grant token manager with auto-refresh."""
 
-    When ``no_auth=True``, all token logic is skipped and ``get_headers()``
-    returns only ``Content-Type`` — for OSB instances exposed without auth.
-    """
-
-    def __init__(self, idp_url, client_id, client_secret, username, password, no_auth=False):
-        self.no_auth = no_auth
-        self.token_url = f"{idp_url.rstrip('/')}/o/token/" if idp_url else ""
+    def __init__(self, idp_url, client_id, client_secret, username, password):
+        self.token_url = f"{idp_url.rstrip('/')}/o/token/"
         self.client_id = client_id
         self.client_secret = client_secret
         self.username = username
@@ -130,8 +125,6 @@ class TokenManager:
         }, "refresh")
 
     def get_token(self):
-        if self.no_auth:
-            return None
         if self._access_token and time.time() < self._expires_at:
             return self._access_token
         if self._refresh_token and self._refresh():
@@ -141,8 +134,6 @@ class TokenManager:
         raise RuntimeError("Unable to obtain access token")
 
     def get_headers(self):
-        if self.no_auth:
-            return {"Content-Type": "application/json"}
         return {"Authorization": f"Bearer {self.get_token()}", "Content-Type": "application/json"}
 
 
@@ -305,22 +296,27 @@ def _normalize_codelist_key(name: str) -> str:
 
 
 _CODELIST_ALIASES = {
-    "studytype":            ["trialtype", "studytyperesponse", "trialtyperesponse"],
-    "studyphase":           ["trialphase", "trialphaseresponse"],
-    "studyblindingschema":  ["trialblindingschema", "trialblindingschemaresponse"],
-    "studyintenttype":      ["trialintenttype", "trialintenttyperesponse"],
+    # SAFE aliases: short name ↔ canonical OSB display name (same codelist).
+    # REMOVED dangerous cross-codelist links:
+    #   studytype ↔ trialtype, studyphase ↔ trialphase,
+    #   studyblindingschema ↔ trialblindingschema, studyintenttype ↔ trialintenttype,
+    #   endpointlevel ↔ endpointsublevel
+    # These caused term_uids to leak between DIFFERENT codelists with
+    # overlapping term names ("Primary", concept_id C79372, …). If a metadata
+    # field needs a different codelist, change the call site to use the
+    # precise name (e.g. "Study Type Response") rather than adding an alias.
+    "studytype":            ["studytyperesponse"],
     "trialtype":            ["trialtyperesponse"],
+    "studyphase":           ["studyphaseresponse"],
     "trialphase":           ["trialphaseresponse"],
+    "studyblindingschema":  ["studyblindingschemaresponse"],
     "trialblindingschema":  ["trialblindingschemaresponse"],
+    "studyintenttype":      ["studyintenttyperesponse"],
     "trialintenttype":      ["trialintenttyperesponse"],
     "interventionmodel":    ["interventionmodelresponse"],
     "interventiontype":     ["interventiontyperesponse"],
     "controltype":          ["controltyperesponse"],
     "sex":                  ["sexofparticipantsresponse"],
-    # NOTE: "endpoint level" and "endpoint sub level" are SEPARATE codelists
-    # with overlapping term names ("Primary", "Secondary", …). Aliasing them
-    # caused term_uids to leak across codelists, producing OSB 400s like
-    # "term ... was not found in the codelist ...". Keep them separate.
 }
 
 
@@ -504,10 +500,11 @@ class CTResolver:
                     codelist_name, code, decode)
         return None
 
-    def resolve_multiple(self, codelist_name, usdm_code_objects):
+    def resolve_multiple(self, codelist_name, usdm_code_objects, strict=False):
         results = []
         for obj in usdm_code_objects:
-            r = self.resolve(codelist_name, code=obj.get("code", ""), decode=obj.get("decode", ""))
+            r = self.resolve(codelist_name, code=obj.get("code", ""),
+                             decode=obj.get("decode", ""), strict=strict)
             if r:
                 results.append(r)
             else:
@@ -754,6 +751,66 @@ def _classify_registry_identifier(ident):
     return None
 
 
+# ── metadata-patch term resolution (strict + cross-codelist validation) ────
+#
+# Map each OSB metadata field to the EXACT codelist name to resolve against.
+# Using the precise "...Response" name + strict=True ensures the resolver
+# never falls through to a similarly-named but DIFFERENT codelist
+# ("SEND Study Type", "Endpoint Sub Level", …) which would produce an OSB
+# 400 "The term identified by uid ... was not found in the codelist ...".
+METADATA_FIELD_CODELIST = {
+    "study_type_code":             "Study Type Response",
+    "trial_phase_code":            "Trial Phase Response",
+    "trial_types_codes":           "Trial Type Response",
+    "intervention_model_code":     "Intervention Model Response",
+    "trial_blinding_schema_code":  "Trial Blinding Schema Response",
+    "trial_intent_types_codes":    "Trial Intent Type Response",
+    "intervention_type_code":      "Intervention Type Response",
+    "control_type_code":           "Control Type Response",
+    "sex_of_participants_code":    "Sex of Participants Response",
+}
+
+
+def _resolve_metadata_term(response_codelist, code, decode):
+    """Strict resolve + cross-codelist validation for a single metadata field.
+
+    Returns the term dict if the resolved term actually belongs to the exact
+    ``response_codelist``; otherwise None (so OSB receives null and doesn't
+    400 on a "term not in codelist" error).
+    """
+    if not code and not decode:
+        return None
+    if ct is None:
+        return None
+    resolved = ct.resolve(response_codelist, code=code, decode=decode, strict=True)
+    if not resolved:
+        log.warning("  metadata: '%s' did not match in '%s' (code=%s decode='%s')",
+                    decode or code, response_codelist, code, decode)
+        return None
+    term_uid = resolved.get("term_uid")
+    if not ct.term_is_in_codelist(term_uid, response_codelist):
+        log.warning(
+            "  metadata: term %s ('%s') is NOT in '%s' codelist — discarding "
+            "to prevent OSB 400 (term not found in codelist)",
+            term_uid, resolved.get("name"), response_codelist,
+        )
+        return None
+    log.info("  metadata: '%s' resolved in '%s' -> %s (%s)",
+             decode or code, response_codelist, resolved.get("name"), term_uid)
+    return resolved
+
+
+def _resolve_metadata_multiple(response_codelist, items):
+    """List variant; drops any cross-codelist leaks."""
+    out = []
+    for item in items or []:
+        r = _resolve_metadata_term(response_codelist,
+                                   item.get("code", ""), item.get("decode", ""))
+        if r:
+            out.append(r)
+    return out
+
+
 def build_metadata_patch(parsed_refs):
     version = parsed_refs["version"]
     design = parsed_refs["design"]
@@ -786,18 +843,18 @@ def build_metadata_patch(parsed_refs):
     hlsd = {}
     if "studyType" in present or design.get("studyType"):
         code, decode = _code_obj(design.get("studyType"))
-        hlsd["study_type_code"] = ct.resolve("Study Type", code=code, decode=decode)
-        log.info("  study_type_code: code=%s decode='%s' -> %s", code, decode, hlsd["study_type_code"])
+        hlsd["study_type_code"] = _resolve_metadata_term(
+            METADATA_FIELD_CODELIST["study_type_code"], code, decode)
 
     if "studyPhase" in present or design.get("studyPhase"):
         code, decode = _alias_code(design.get("studyPhase"))
-        hlsd["trial_phase_code"] = ct.resolve("Trial Phase", code=code, decode=decode)
-        log.info("  trial_phase_code: code=%s decode='%s' -> %s", code, decode, hlsd["trial_phase_code"])
+        hlsd["trial_phase_code"] = _resolve_metadata_term(
+            METADATA_FIELD_CODELIST["trial_phase_code"], code, decode)
 
     sub_types = design.get("subTypes", [])
     if sub_types:
-        hlsd["trial_types_codes"] = ct.resolve_multiple("Trial Type", sub_types) or None
-        log.info("  trial_types_codes: %d resolved", len(hlsd.get("trial_types_codes") or []))
+        hlsd["trial_types_codes"] = _resolve_metadata_multiple(
+            METADATA_FIELD_CODELIST["trial_types_codes"], sub_types) or None
 
     if hlsd:
         metadata["high_level_study_design"] = hlsd
@@ -821,8 +878,8 @@ def build_metadata_patch(parsed_refs):
     planned_sex = population.get("plannedSex", [])
     if planned_sex and planned_sex[0]:
         code, decode = _code_obj(planned_sex[0])
-        pop["sex_of_participants_code"] = ct.resolve("Sex", code=code, decode=decode)
-        log.info("  sex_of_participants_code: code=%s decode='%s' -> %s", code, decode, pop.get("sex_of_participants_code"))
+        pop["sex_of_participants_code"] = _resolve_metadata_term(
+            METADATA_FIELD_CODELIST["sex_of_participants_code"], code, decode)
 
     enrollment = population.get("plannedEnrollmentNumber", population.get("plannedEnrollmentNumberQuantity", {}))
     if enrollment and enrollment.get("value") is not None:
@@ -848,18 +905,18 @@ def build_metadata_patch(parsed_refs):
     interv = {}
     if design.get("model"):
         code, decode = _code_obj(design["model"])
-        interv["intervention_model_code"] = ct.resolve("Intervention Model", code=code, decode=decode)
-        log.info("  intervention_model_code: code=%s decode='%s' -> %s", code, decode, interv.get("intervention_model_code"))
+        interv["intervention_model_code"] = _resolve_metadata_term(
+            METADATA_FIELD_CODELIST["intervention_model_code"], code, decode)
 
     if design.get("blindingSchema"):
         code, decode = _alias_code(design["blindingSchema"])
-        interv["trial_blinding_schema_code"] = ct.resolve("Trial Blinding Schema", code=code, decode=decode)
-        log.info("  trial_blinding_schema_code: code=%s decode='%s' -> %s", code, decode, interv.get("trial_blinding_schema_code"))
+        interv["trial_blinding_schema_code"] = _resolve_metadata_term(
+            METADATA_FIELD_CODELIST["trial_blinding_schema_code"], code, decode)
 
     intent_types = design.get("intentTypes", [])
     if intent_types:
-        interv["trial_intent_types_codes"] = ct.resolve_multiple("Trial Intent Type", intent_types) or None
-        log.info("  trial_intent_types_codes: %d resolved", len(interv.get("trial_intent_types_codes") or []))
+        interv["trial_intent_types_codes"] = _resolve_metadata_multiple(
+            METADATA_FIELD_CODELIST["trial_intent_types_codes"], intent_types) or None
 
     # intervention_type_code: studyDesign.interventionType wins, else first
     # version.studyInterventions[*].type.
@@ -876,9 +933,8 @@ def build_metadata_patch(parsed_refs):
             if code or decode:
                 break
     if code or decode:
-        interv["intervention_type_code"] = ct.resolve("Intervention Type", code=code, decode=decode)
-        log.info("  intervention_type_code: code=%s decode='%s' -> %s",
-                 code, decode, interv.get("intervention_type_code"))
+        interv["intervention_type_code"] = _resolve_metadata_term(
+            METADATA_FIELD_CODELIST["intervention_type_code"], code, decode)
 
     # control_type_code: studyDesign.controlType (synthesizer-provided)
     ct_type_obj = design.get("controlType")
@@ -887,9 +943,8 @@ def build_metadata_patch(parsed_refs):
             code, decode = _alias_code(ct_type_obj)
         else:
             code, decode = _code_obj(ct_type_obj)
-        interv["control_type_code"] = ct.resolve("Control Type", code=code, decode=decode)
-        log.info("  control_type_code: code=%s decode='%s' -> %s",
-                 code, decode, interv.get("control_type_code"))
+        interv["control_type_code"] = _resolve_metadata_term(
+            METADATA_FIELD_CODELIST["control_type_code"], code, decode)
 
     if interv:
         metadata["study_intervention"] = interv
@@ -2521,7 +2576,7 @@ def _load_config_file(path):
         return json.load(fh)
 
 
-def _resolve_credentials(cfg_path=None, no_auth=False):
+def _resolve_credentials(cfg_path=None):
     """Return (idp_url, api_url, client_id, client_secret, username, password).
 
     Resolution order for each value:
@@ -2530,23 +2585,14 @@ def _resolve_credentials(cfg_path=None, no_auth=False):
          OSB_CLIENT_SECRET, OSB_USERNAME, OSB_PASSWORD)
       3. Module-level defaults (non-secret fields only)
       4. Interactive prompt (secret fields that are still blank)
-
-    When ``no_auth=True``, only ``api_url`` is required; all credential
-    resolution and interactive prompts are skipped. The config file (if
-    supplied) still provides ``api_base_url`` and ``project_number``.
     """
     cfg = {}
     if cfg_path:
         cfg = _load_config_file(cfg_path)
         log.info("Loaded config from: %s", cfg_path)
 
-    api_url = cfg.get("api_base_url") or os.environ.get("OSB_API_URL") or API_BASE_URL
-
-    if no_auth:
-        log.info("Running in --no-auth mode: skipping OAuth2 credential resolution.")
-        return "", api_url, "", "", "", ""
-
     idp_url     = cfg.get("idp_url")     or os.environ.get("OSB_IDP_URL")     or IDP_URL
+    api_url     = cfg.get("api_base_url") or os.environ.get("OSB_API_URL")     or API_BASE_URL
     client_id   = cfg.get("client_id")   or os.environ.get("OSB_CLIENT_ID")   or OAUTH_CLIENT_ID
     secret      = cfg.get("client_secret") or os.environ.get("OSB_CLIENT_SECRET") or OAUTH_CLIENT_SECRET
     username    = cfg.get("username")    or os.environ.get("OSB_USERNAME")    or OAUTH_USERNAME
@@ -2563,21 +2609,18 @@ def _resolve_credentials(cfg_path=None, no_auth=False):
     return idp_url, api_url, client_id, secret, username, password
 
 
-def main(usdm_path=None, cfg_path=None, no_auth=False):
+def main(usdm_path=None, cfg_path=None):
     """Main entry point - mirrors the notebook execution flow."""
     global token_mgr, ct, USDM_FILE_PATH, API_BASE_URL
 
     if usdm_path:
         USDM_FILE_PATH = usdm_path
 
-    if no_auth is False:
-        no_auth = os.environ.get("OSB_NO_AUTH", "").lower() in ("1", "true", "yes")
-
-    idp_url, api_url, client_id, secret, username, password = _resolve_credentials(cfg_path, no_auth=no_auth)
+    idp_url, api_url, client_id, secret, username, password = _resolve_credentials(cfg_path)
     API_BASE_URL = api_url
 
     # Initialize token manager
-    token_mgr = TokenManager(idp_url, client_id, secret, username, password, no_auth=no_auth)
+    token_mgr = TokenManager(idp_url, client_id, secret, username, password)
 
     # Phase 1: Validation
     log.info("Loading USDM file: %s", USDM_FILE_PATH)
@@ -2623,9 +2666,6 @@ if __name__ == "__main__":
     parser.add_argument("--client-secret", type=str, default=None, help="OAuth2 client secret")
     parser.add_argument("--username", type=str, default=None, help="OSB username (email)")
     parser.add_argument("--password", type=str, default=None, help="OSB password")
-    parser.add_argument("--no-auth", action="store_true",
-                        help="Connect to an OSB instance that has no authentication "
-                             "(skips OAuth2; only --api-url / config api_base_url is needed)")
     args = parser.parse_args()
 
     # CLI args override env vars — push them into env so _resolve_credentials picks them up
@@ -2642,4 +2682,4 @@ if __name__ == "__main__":
     if args.password:
         os.environ["OSB_PASSWORD"] = args.password
 
-    main(usdm_path=args.usdm, cfg_path=args.config, no_auth=args.no_auth)
+    main(usdm_path=args.usdm, cfg_path=args.config)

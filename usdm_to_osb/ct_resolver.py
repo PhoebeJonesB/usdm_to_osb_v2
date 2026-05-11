@@ -28,23 +28,36 @@ logger = logging.getLogger(__name__)
 # If a mapper asks for "Study Type" but the OSB instance calls it
 # "Trial Type" (or vice-versa), this alias table lets the resolver
 # transparently try the synonym.  Both directions are registered automatically.
+# Each entry maps a SHORT codelist name to its canonical OSB display name.
+# These aliases are SAFE because the short and canonical names refer to the
+# SAME codelist in OSB (just renamed). The init code adds them bidirectionally
+# so a lookup for either form finds the loaded codelist.
+#
+# REMOVED (used to be here, dangerous):
+#   "study type" → "trial type"  — these are SEPARATE codelists
+#   "study phase" → "trial phase" — same
+#   "study blinding schema" → "trial blinding schema" — same
+#   "study intent type" → "trial intent type" — same
+#   "endpoint level" → "endpoint sub level" — same
+# A bidirectional alias between two different codelists with overlapping term
+# names ("Primary", "Secondary", concept_id C79372, …) causes term_uids to
+# leak across codelists and OSB rejects with "term ... not found in codelist".
+# If a metadata field needs to map to a different OSB codelist, change the
+# call site to use the precise codelist name (e.g. "Study Type Response")
+# instead of adding an alias.
 CODELIST_ALIASES: dict[str, list[str]] = {
-    "study type":              ["trial type", "study type response", "trial type response"],
-    "study phase":             ["trial phase", "trial phase response"],
-    "study blinding schema":   ["trial blinding schema", "trial blinding schema response"],
-    "study intent type":       ["trial intent type", "trial intent type response"],
+    "study type":              ["study type response"],
     "trial type":              ["trial type response"],
+    "study phase":             ["study phase response"],
     "trial phase":             ["trial phase response"],
+    "study blinding schema":   ["study blinding schema response"],
     "trial blinding schema":   ["trial blinding schema response"],
+    "study intent type":       ["study intent type response"],
     "trial intent type":       ["trial intent type response"],
     "intervention model":      ["intervention model response"],
     "intervention type":       ["intervention type response"],
     "control type":            ["control type response"],
     "sex":                     ["sex of participants response"],
-    # NOTE: "endpoint level" and "endpoint sub level" are SEPARATE codelists
-    # with overlapping term names ("Primary", "Secondary", …). Aliasing them
-    # caused term_uids to leak across codelists, producing OSB 400s like
-    # "term ... was not found in the codelist ...". Keep them separate.
 }
 
 
@@ -414,18 +427,20 @@ class CTResolver:
                        codelist_name, code, decode)
         return None
 
-    def resolve_multiple(self, codelist_name: str, items: list[dict]) -> list[dict]:
+    def resolve_multiple(self, codelist_name: str, items: list[dict],
+                         strict: bool = False) -> list[dict]:
         """
-        Resolve a list of USDM Code objects (each having 'code' and optionally 'decode')
-        against a single codelist.
+        Resolve a list of USDM Code objects against a single codelist.
 
-        Returns list of {"term_uid": ..., "name": ..., "submission_value": ...} for each matched term.
+        When ``strict=True``, the fuzzy CODELIST fallback is disabled — use
+        this for metadata-patch fields where a wrong-codelist term causes OSB
+        to reject the PATCH with a "term not in codelist" 400.
         """
         results = []
         for item in items:
             code = item.get("code", "")
             decode = item.get("decode", "")
-            resolved = self.resolve(codelist_name, code=code, decode=decode)
+            resolved = self.resolve(codelist_name, code=code, decode=decode, strict=strict)
             if resolved:
                 results.append(resolved)
             else:
