@@ -79,14 +79,28 @@ PROJECT_NUMBER_OVERRIDE = None  # e.g. "999"
 # ==============================================================================
 
 class TokenManager:
-    """OAuth2 password-grant token manager with auto-refresh."""
+    """OAuth2 password-grant token manager with auto-refresh.
 
-    def __init__(self, idp_url, client_id, client_secret, username, password):
-        self.token_url = f"{idp_url.rstrip('/')}/o/token/"
-        self.client_id = client_id
-        self.client_secret = client_secret
-        self.username = username
-        self.password = password
+    When ``no_auth=True``, all methods become no-ops and ``get_headers()``
+    returns only Content-Type — requests go out without an Authorization
+    header (for OSB instances running without an IDP).
+    """
+
+    def __init__(self, idp_url, client_id, client_secret, username, password, no_auth=False):
+        self.no_auth = bool(no_auth)
+        if self.no_auth:
+            log.info("[TokenManager] --no-auth mode (no Authorization header will be sent)")
+            self.token_url = ""
+            self.client_id = ""
+            self.client_secret = ""
+            self.username = ""
+            self.password = ""
+        else:
+            self.token_url = f"{(idp_url or '').rstrip('/')}/o/token/"
+            self.client_id = client_id
+            self.client_secret = client_secret
+            self.username = username
+            self.password = password
         self._access_token = None
         self._refresh_token = None
         self._expires_at = 0.0
@@ -109,6 +123,8 @@ class TokenManager:
         return False
 
     def _authenticate(self):
+        if self.no_auth:
+            return True
         return self._send({
             "grant_type": "password",
             "client_id": self.client_id, "client_secret": self.client_secret,
@@ -116,6 +132,8 @@ class TokenManager:
         }, "password-grant")
 
     def _refresh(self):
+        if self.no_auth:
+            return True
         if not self._refresh_token:
             return False
         return self._send({
@@ -125,6 +143,8 @@ class TokenManager:
         }, "refresh")
 
     def get_token(self):
+        if self.no_auth:
+            return ""
         if self._access_token and time.time() < self._expires_at:
             return self._access_token
         if self._refresh_token and self._refresh():
@@ -134,6 +154,8 @@ class TokenManager:
         raise RuntimeError("Unable to obtain access token")
 
     def get_headers(self):
+        if self.no_auth:
+            return {"Content-Type": "application/json"}
         return {"Authorization": f"Bearer {self.get_token()}", "Content-Type": "application/json"}
 
 
@@ -2576,20 +2598,25 @@ def _load_config_file(path):
         return json.load(fh)
 
 
-def _resolve_credentials(cfg_path=None):
-    """Return (idp_url, api_url, client_id, client_secret, username, password).
+def _resolve_credentials(cfg_path=None, no_auth=False):
+    """Return (idp_url, api_url, client_id, client_secret, username, password, no_auth).
 
     Resolution order for each value:
       1. Config file (if --config / cfg_path supplied)
       2. Environment variables (OSB_IDP_URL, OSB_API_URL, OSB_CLIENT_ID,
-         OSB_CLIENT_SECRET, OSB_USERNAME, OSB_PASSWORD)
+         OSB_CLIENT_SECRET, OSB_USERNAME, OSB_PASSWORD, OSB_NO_AUTH)
       3. Module-level defaults (non-secret fields only)
-      4. Interactive prompt (secret fields that are still blank)
+      4. Interactive prompt (secret fields that are still blank) — SKIPPED
+         when no_auth is True.
     """
     cfg = {}
     if cfg_path:
         cfg = _load_config_file(cfg_path)
         log.info("Loaded config from: %s", cfg_path)
+
+    # no_auth: CLI flag wins, then config file, then env var
+    no_auth = bool(no_auth) or bool(cfg.get("no_auth", False)) \
+              or os.environ.get("OSB_NO_AUTH", "").lower() in ("1", "true", "yes")
 
     idp_url     = cfg.get("idp_url")     or os.environ.get("OSB_IDP_URL")     or IDP_URL
     api_url     = cfg.get("api_base_url") or os.environ.get("OSB_API_URL")     or API_BASE_URL
@@ -2598,29 +2625,37 @@ def _resolve_credentials(cfg_path=None):
     username    = cfg.get("username")    or os.environ.get("OSB_USERNAME")    or OAUTH_USERNAME
     password    = cfg.get("password")    or os.environ.get("OSB_PASSWORD")    or OAUTH_PASSWORD
 
-    # Prompt for any secrets still missing
-    if not username:
-        username = input("OSB username (email): ").strip()
-    if not secret:
-        secret = getpass.getpass("OAuth2 client secret: ")
-    if not password:
-        password = getpass.getpass("OSB password: ")
+    if no_auth:
+        log.info("Credentials resolved with --no-auth (skipping any interactive prompts)")
+    else:
+        # Prompt for any secrets still missing
+        if not username:
+            username = input("OSB username (email): ").strip()
+        if not secret:
+            secret = getpass.getpass("OAuth2 client secret: ")
+        if not password:
+            password = getpass.getpass("OSB password: ")
 
-    return idp_url, api_url, client_id, secret, username, password
+    return idp_url, api_url, client_id, secret, username, password, no_auth
 
 
-def main(usdm_path=None, cfg_path=None):
-    """Main entry point - mirrors the notebook execution flow."""
+def main(usdm_path=None, cfg_path=None, no_auth=False):
+    """Main entry point - mirrors the notebook execution flow.
+
+    ``no_auth=True`` (or OSB_NO_AUTH env var, or "no_auth": true in the
+    config file) skips OAuth and sends requests without an Authorization
+    header — for local OSB instances that don't gate on an IDP.
+    """
     global token_mgr, ct, USDM_FILE_PATH, API_BASE_URL
 
     if usdm_path:
         USDM_FILE_PATH = usdm_path
 
-    idp_url, api_url, client_id, secret, username, password = _resolve_credentials(cfg_path)
+    idp_url, api_url, client_id, secret, username, password, no_auth = _resolve_credentials(cfg_path, no_auth=no_auth)
     API_BASE_URL = api_url
 
     # Initialize token manager
-    token_mgr = TokenManager(idp_url, client_id, secret, username, password)
+    token_mgr = TokenManager(idp_url, client_id, secret, username, password, no_auth=no_auth)
 
     # Phase 1: Validation
     log.info("Loading USDM file: %s", USDM_FILE_PATH)

@@ -8,36 +8,57 @@ logger = logging.getLogger(__name__)
 
 
 class Config:
-    """Holds all connection settings. Edit or override via env vars / CLI args."""
+    """Holds all connection settings. Edit or override via env vars / CLI args.
+
+    When ``no_auth=True``, IDP / client / username / password are not required
+    — useful for local dev OSB instances running without an identity provider.
+    """
 
     def __init__(
         self,
         api_base_url: str,
-        idp_url: str,
-        client_id: str,
-        client_secret: str,
-        username: str,
-        password: str,
+        idp_url: str = "",
+        client_id: str = "",
+        client_secret: str = "",
+        username: str = "",
+        password: str = "",
         project_number: str = "999",
+        no_auth: bool = False,
     ):
         self.api_base_url = api_base_url.rstrip("/")
-        self.idp_url = idp_url.rstrip("/")
+        self.idp_url = (idp_url or "").rstrip("/")
         self.client_id = client_id
         self.client_secret = client_secret
         self.username = username
         self.password = password
         self.project_number = project_number
+        self.no_auth = no_auth
 
 
 class TokenManager:
-    """Manages OAuth2 tokens using the password grant flow with auto-refresh."""
+    """Manages OAuth2 tokens using the password grant flow with auto-refresh.
+
+    When ``config.no_auth`` is True, every method becomes a no-op and
+    ``get_headers()`` returns only ``Content-Type`` — the request goes out
+    without an ``Authorization`` header. Suitable for local OSB instances
+    that don't gate requests behind an IDP.
+    """
 
     def __init__(self, config: Config):
-        self.token_url = f"{config.idp_url}/o/token/"
-        self.client_id = config.client_id
-        self.client_secret = config.client_secret
-        self.username = config.username
-        self.password = config.password
+        self.no_auth = bool(getattr(config, "no_auth", False))
+        if self.no_auth:
+            logger.info("TokenManager: --no-auth mode (no Authorization header will be sent)")
+            self.token_url = ""
+            self.client_id = ""
+            self.client_secret = ""
+            self.username = ""
+            self.password = ""
+        else:
+            self.token_url = f"{config.idp_url}/o/token/"
+            self.client_id = config.client_id
+            self.client_secret = config.client_secret
+            self.username = config.username
+            self.password = config.password
         self._access_token = None
         self._refresh_token = None
         self._expires_at = 0.0
@@ -62,6 +83,8 @@ class TokenManager:
             return False
 
     def _authenticate(self) -> bool:
+        if self.no_auth:
+            return True
         return self._request_token(
             {
                 "grant_type": "password",
@@ -74,6 +97,8 @@ class TokenManager:
         )
 
     def _refresh(self) -> bool:
+        if self.no_auth:
+            return True
         if not self._refresh_token:
             return False
         return self._request_token(
@@ -87,6 +112,8 @@ class TokenManager:
         )
 
     def get_token(self) -> str:
+        if self.no_auth:
+            return ""
         if self._access_token and time.time() < self._expires_at:
             return self._access_token
         if self._refresh_token and self._refresh():
@@ -96,6 +123,8 @@ class TokenManager:
         raise RuntimeError("Unable to obtain access token")
 
     def get_headers(self) -> dict:
+        if self.no_auth:
+            return {"Content-Type": "application/json"}
         return {
             "Authorization": f"Bearer {self.get_token()}",
             "Content-Type": "application/json",

@@ -79,28 +79,41 @@ def get_next_study_number(api: APIClient) -> str:
 
 
 def _build_config(args) -> Config:
-    """Build Config from --config file or CLI args."""
+    """Build Config from --config file or CLI args.
+
+    Honors ``--no-auth`` (and config file's ``"no_auth": true``) to skip
+    OAuth entirely. In that mode credentials are not required and OSB
+    requests go out without an Authorization header.
+    """
+    no_auth_cli = bool(getattr(args, "no_auth", False))
+
     if args.config:
         with open(args.config, encoding="utf-8") as f:
             cfg = json.load(f)
+        no_auth = bool(cfg.get("no_auth", False)) or no_auth_cli
         return Config(
             api_base_url=cfg.get("api_base_url", args.api_url),
-            idp_url=cfg.get("idp_url", args.idp_url),
-            client_id=cfg.get("client_id", args.client_id),
-            client_secret=cfg.get("client_secret", ""),
-            username=cfg.get("username", ""),
-            password=cfg.get("password", ""),
+            idp_url=cfg.get("idp_url", args.idp_url) or "",
+            client_id=cfg.get("client_id", args.client_id) or "",
+            client_secret=cfg.get("client_secret", "") or "",
+            username=cfg.get("username", "") or "",
+            password=cfg.get("password", "") or "",
+            no_auth=no_auth,
         )
-    if not args.client_secret or not args.username or not args.password:
-        print("ERROR: --client-secret, --username, and --password are required (or use --config)")
+
+    if not no_auth_cli and (not args.client_secret or not args.username or not args.password):
+        print("ERROR: --client-secret, --username, and --password are required "
+              "(or use --config, or --no-auth for an unauthenticated OSB instance)")
         sys.exit(1)
+
     return Config(
         api_base_url=args.api_url,
-        idp_url=args.idp_url,
-        client_id=args.client_id,
-        client_secret=args.client_secret,
-        username=args.username,
-        password=args.password,
+        idp_url=args.idp_url or "",
+        client_id=args.client_id or "",
+        client_secret=args.client_secret or "",
+        username=args.username or "",
+        password=args.password or "",
+        no_auth=no_auth_cli,
     )
 
 
@@ -299,6 +312,9 @@ Workflow:
     p_up.add_argument("--username", help="OSB username")
     p_up.add_argument("--password", help="OSB password")
     p_up.add_argument("--config", help="Path to JSON config file (overrides CLI args)")
+    p_up.add_argument("--no-auth", action="store_true",
+                      help="Skip OAuth — talk to an OSB instance with no IDP gating "
+                           "(credentials become optional)")
     p_up.add_argument(
         "--skip", nargs="*", default=[],
         choices=["metadata", "arms", "epochs", "elements", "cells", "visits", "objectives", "criteria", "activities"],
@@ -314,6 +330,8 @@ Workflow:
     p_cl.add_argument("--username", help="OSB username")
     p_cl.add_argument("--password", help="OSB password")
     p_cl.add_argument("--config", help="Path to JSON config file")
+    p_cl.add_argument("--no-auth", action="store_true",
+                      help="Skip OAuth — talk to an OSB instance with no IDP gating")
     p_cl.add_argument("--log-dir", default=".", help="Directory for log files")
 
     args = parser.parse_args()
