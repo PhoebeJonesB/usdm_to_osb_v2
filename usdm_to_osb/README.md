@@ -30,11 +30,24 @@ pip install requests beautifulsoup4
 
 ---
 
+## Two run modes
+
+The uploader supports two ways to reach the OSB API:
+
+| Mode | Flag | When to use |
+|---|---|---|
+| **Unauthenticated** | `--no-auth` | OSB instance with no IDP gating — typically local dev sandboxes (e.g. `https://devsandbox.htp42.site/api`). No credentials required, no `Authorization` header is sent. |
+| **Authenticated (OAuth2)** | `--config <file>` | Any OSB instance gated by an IDP. Credentials come from a JSON config file. |
+
+Either mode is selected per-run by a single CLI flag — see Quick Start below.
+
+---
+
 ## Setup — after cloning
 
-Before running, you must supply your OSB instance URLs and credentials. There are no working defaults — the placeholders in the code (`https://your-osb-instance/api`, `https://your-idp-instance`) are intentionally blank and must be replaced with your real values.
+Before running, you must supply your OSB instance URL (and credentials, unless you're using `--no-auth`). There are no working defaults — the placeholders in the code (`https://your-osb-instance/api`, `https://your-idp-instance`) are intentionally blank and must be replaced with your real values.
 
-The recommended way to do this is via the config file (see below). Alternatively, set environment variables:
+The recommended way for authenticated mode is via the config file (see below). Alternatively, set environment variables:
 
 | Variable | Description |
 |---|---|
@@ -44,6 +57,7 @@ The recommended way to do this is via the config file (see below). Alternatively
 | `OSB_CLIENT_SECRET` | OAuth2 client secret |
 | `OSB_USERNAME` | OSB login email |
 | `OSB_PASSWORD` | OSB password |
+| `OSB_NO_AUTH` | Set to `1` to force unauthenticated mode (same as `--no-auth`) |
 
 ---
 
@@ -74,10 +88,11 @@ Then edit `config.json`:
 
 **Credential resolution order** — the script looks for each value in this order and uses the first one it finds:
 
-1. `--config config.json` (recommended)
-2. Environment variables: `OSB_CLIENT_SECRET`, `OSB_USERNAME`, `OSB_PASSWORD`, `OSB_CLIENT_ID`, `OSB_API_URL`, `OSB_IDP_URL`
-3. CLI flags: `--client-secret`, `--username`, `--password`, etc.
-4. Interactive prompt at runtime (for any secrets still missing)
+1. `--no-auth` → short-circuits the whole chain; no credentials are read, no prompts, no IDP round-trip
+2. `--config config.json` (recommended for authenticated mode)
+3. Environment variables: `OSB_CLIENT_SECRET`, `OSB_USERNAME`, `OSB_PASSWORD`, `OSB_CLIENT_ID`, `OSB_API_URL`, `OSB_IDP_URL`, `OSB_NO_AUTH`
+4. CLI flags: `--client-secret`, `--username`, `--password`, etc.
+5. Interactive prompt at runtime (for any secrets still missing — skipped under `--no-auth`)
 
 ---
 
@@ -93,7 +108,27 @@ python -m usdm_to_osb --usdm "C:\full\path\to\study.json"
 
 Reports which sections are present, missing, or optional. Exits before touching the API if validation fails.
 
-### Step 2 — Upload
+### Step 2 — Upload (pick one of the two modes)
+
+#### Mode A — Unauthenticated OSB (`--no-auth`)
+
+For local dev sandboxes or any OSB instance running without an IDP:
+
+```bash
+python -m usdm_to_osb \
+    --usdm    "C:\Users\HP\usdm_to_osb_refactored\USDM_4_0_examples\Alexion_NCT04573309_Wilsons_structured_labels.json" \
+    --api-url "https://devsandbox.htp42.site/api" \
+    --no-auth
+```
+
+The script will:
+1. Re-validate the USDM file (safety check)
+2. Prompt `Validation passed. Proceed with upload? (yes/no)`
+3. **Skip OAuth entirely** — no IDP round-trip, no `Authorization` header is sent. You'll see this in the log: `[TokenManager] --no-auth mode (no Authorization header will be sent)`
+4. Fetch all CT terms from the OSB frontend and build dynamic lookup indexes
+5. Create the study and upload every section in order
+
+#### Mode B — Authenticated OSB (`--config`)
 
 Once validation passes, re-run with `--config`:
 
@@ -106,11 +141,13 @@ python -m usdm_to_osb \
 The script will:
 1. Re-validate the USDM file (safety check)
 2. Prompt `Validation passed. Proceed with upload? (yes/no)`
-3. Authenticate via OAuth2 using the credentials from `config.json`
+3. **Authenticate via OAuth2** using the credentials from `config.json`
 4. Fetch all CT terms from the OSB frontend and build dynamic lookup indexes
 5. Create the study and upload every section in order
 
 > Always use **absolute paths** for `--usdm` and `--config` to avoid "file not found" errors regardless of which directory you run the command from.
+>
+> If you pass both `--no-auth` and `--config`, `--no-auth` wins (you'll see `NOTE: --no-auth supersedes --config` on stdout).
 
 ---
 
@@ -122,8 +159,13 @@ python -m usdm_to_osb [options]
 Required:
   --usdm FILE          Path to the USDM 4.0 JSON file
 
-Credential options (use --config for simplest setup):
-  --config FILE        Path to JSON config file with all credentials
+Mode selector:
+  --no-auth            UNAUTHENTICATED mode — skip OAuth entirely. No
+                       Authorization header is sent and credentials are not
+                       required. Use for OSB instances running without an IDP.
+
+Credential options (used in authenticated mode; ignored under --no-auth):
+  --config FILE        Path to JSON config file with all credentials (recommended)
   --api-url URL        OSB API base URL
   --idp-url URL        OAuth2 IDP URL
   --client-id ID       OAuth2 client ID (default: osbidp)
@@ -135,18 +177,24 @@ Credential options (use --config for simplest setup):
 ### Examples
 
 ```bash
-# Recommended — config file with absolute paths
+# Unauthenticated OSB (local dev sandbox)
+python -m usdm_to_osb \
+    --usdm    "C:\full\path\to\study.json" \
+    --api-url "https://devsandbox.htp42.site/api" \
+    --no-auth
+
+# Authenticated — config file with absolute paths (recommended)
 python -m usdm_to_osb \
     --usdm   "C:\full\path\to\devices.json" \
     --config "C:\full\path\to\usdm_to_osb\config.json"
 
-# Using environment variables instead of a config file
+# Authenticated — environment variables instead of a config file
 set OSB_USERNAME=you@example.com
 set OSB_CLIENT_SECRET=your_secret
 set OSB_PASSWORD=your_password
 python -m usdm_to_osb --usdm "C:\full\path\to\study.json"
 
-# Override a single URL while still loading credentials from config
+# Authenticated — override a single URL while still loading credentials from config
 python -m usdm_to_osb \
     --usdm    "C:\full\path\to\study.json" \
     --config  "C:\full\path\to\usdm_to_osb\config.json" \

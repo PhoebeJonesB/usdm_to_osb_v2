@@ -154,28 +154,50 @@ def _parse_iso8601_duration(value: str) -> tuple[float | None, str]:
 
 # ── study creation ───────────────────────────────────────────────────────────
 
+def _pick_titles_by_position(titles: list) -> tuple[str, str]:
+    """
+    Pick study_title and study_short_title from ``version.titles`` by POSITION,
+    ignoring each title's ``type.decode`` ("Official Study Title", "Brief …").
+
+    Rules:
+      - 0 titles  -> ("",          "")
+      - 1 title   -> (titles[0],   "")
+      - 2+ titles -> (titles[0],   titles[1])    # any extras are ignored
+
+    Empty / whitespace-only text values are treated as missing.
+    """
+    cleaned = [
+        (t.get("text") or "").strip()
+        for t in (titles or [])
+        if isinstance(t, dict)
+    ]
+    cleaned = [t for t in cleaned if t]
+    title = cleaned[0] if len(cleaned) >= 1 else ""
+    short = cleaned[1] if len(cleaned) >= 2 else ""
+    return title, short
+
+
 def map_study_creation(usdm: dict, study_number: str) -> dict:
     """
     Build the POST /studies payload from USDM root.
 
-    - project_number comes from studyIdentifiers[0].text
-    - study_parent_part_uid is None (no parent)
+    - title is picked POSITIONALLY from ``version.titles`` (first item),
+      not by ``type.decode``.
+    - project_number comes from studyIdentifiers[0].text.
+    - study_parent_part_uid is None (no parent).
     """
     study = usdm.get("study", {})
     versions = study.get("versions", [])
     version = versions[0] if versions else {}
 
-    # Official title
-    title = ""
-    for t in version.get("titles", []):
-        if t.get("type", {}).get("decode", "") == "Official Study Title":
-            title = t.get("text", "")
-            break
+    title, _ = _pick_titles_by_position(version.get("titles", []))
 
     # Project number = first studyIdentifier text
     identifiers = version.get("studyIdentifiers", [])
     project_number = identifiers[0].get("text", "999") if identifiers else "999"
     logger.info("project_number from studyIdentifiers[0]: %s", project_number)
+    logger.info("study_title picked positionally from version.titles[0]: '%s'",
+                (title[:80] + "…") if len(title) > 80 else title)
 
     return {
         "study_number": study_number,
@@ -288,19 +310,22 @@ def map_identification_metadata(version: dict) -> dict:
 # ── study description ───────────────────────────────────────────────────────
 
 def map_study_description(version: dict) -> dict:
-    """Build study_description from titles."""
-    titles = version.get("titles", [])
-    official = None
-    brief = None
-    for t in titles:
-        decode = t.get("type", {}).get("decode", "")
-        if decode == "Official Study Title":
-            official = t.get("text", "")
-        elif decode == "Brief Study Title":
-            brief = t.get("text", "")
+    """Build study_description from titles.
+
+    Titles are picked POSITIONALLY from ``version.titles``:
+      - first item → ``study_title``
+      - second item (if present) → ``study_short_title``
+    ``type.decode`` is intentionally ignored — some USDMs use sponsor-specific
+    decodes (or no decode at all) and the upload should still pick the right
+    text in title order.
+    """
+    title, short = _pick_titles_by_position(version.get("titles", []))
+    logger.info("study_description titles (positional): title='%s' short='%s'",
+                (title[:60] + "…") if len(title) > 60 else title,
+                (short[:60] + "…") if len(short) > 60 else short)
     return {
-        "study_title": official,
-        "study_short_title": brief,
+        "study_title": title or None,
+        "study_short_title": short or None,
     }
 
 

@@ -624,6 +624,26 @@ def strip_html(html):
     return re.sub(r"<[^>]+>", "", html).strip()
 
 
+def _pick_titles_by_position(titles):
+    """Pick (study_title, study_short_title) POSITIONALLY from version.titles.
+
+    Rules (type.decode is intentionally ignored):
+      - 0 titles  -> ("",          "")
+      - 1 title   -> (titles[0],   "")
+      - 2+ titles -> (titles[0],   titles[1])    # extras ignored
+    Empty/whitespace text values are treated as missing.
+    """
+    cleaned = [
+        (t.get("text") or "").strip()
+        for t in (titles or [])
+        if isinstance(t, dict)
+    ]
+    cleaned = [t for t in cleaned if t]
+    title = cleaned[0] if len(cleaned) >= 1 else ""
+    short = cleaned[1] if len(cleaned) >= 2 else ""
+    return title, short
+
+
 def sanitize_name(text):
     return text.replace("[", "(").replace("]", ")")
 
@@ -672,11 +692,10 @@ def create_study(parsed_refs):
         project_number = identifiers[0].get("text", "999") if identifiers else "999"
     log.info("Using project_number: %s (from studyIdentifiers[0])", project_number)
 
-    title1 = ""
-    for t in titles:
-        if t.get("type", {}).get("decode", "") == "Official Study Title":
-            title1 = t.get("text", "")
-            break
+    # Pick title positionally (first item in version.titles) — ignore decode.
+    title1, _ = _pick_titles_by_position(titles)
+    log.info("study_title picked positionally from version.titles[0]: '%s'",
+             (title1[:80] + "…") if len(title1) > 80 else title1)
 
     study_number = get_next_study_number()
 
@@ -853,14 +872,15 @@ def build_metadata_patch(parsed_refs):
             registry[field] = (ident.get("text") or "").strip() or None
     metadata["identification_metadata"] = {"registry_identifiers": registry}
 
-    official = brief = None
-    for t in titles:
-        dec = t.get("type", {}).get("decode", "")
-        if dec == "Official Study Title":
-            official = t.get("text", "")
-        elif dec == "Brief Study Title":
-            brief = t.get("text", "")
-    metadata["study_description"] = {"study_title": official, "study_short_title": brief}
+    # Titles picked POSITIONALLY (decode is intentionally ignored).
+    title_text, short_text = _pick_titles_by_position(titles)
+    log.info("study_description titles (positional): title='%s' short='%s'",
+             (title_text[:60] + "…") if len(title_text) > 60 else title_text,
+             (short_text[:60] + "…") if len(short_text) > 60 else short_text)
+    metadata["study_description"] = {
+        "study_title":       title_text or None,
+        "study_short_title": short_text or None,
+    }
 
     hlsd = {}
     if "studyType" in present or design.get("studyType"):
